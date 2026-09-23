@@ -23,6 +23,9 @@ import time
 
 from canoncompose import (
     DecompositionCycleError,
+    INSERT_CHUNK_INDEX,
+    InvalidInputError,
+    NormalizedEditor,
     SegmentLimitError,
     StreamNormalizer,
     normalize,
@@ -95,7 +98,76 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("4. 拒绝边界 A：循环分解表（真实触发）")
+    print("4. 按位置插入（正常结果：触发组合、重排与来源映射）")
+    print("-" * 68)
+    # 起始规范文本 = 单独的 a。在尾缝（偏移 1）插入 grave → a+grave 组合。
+    editor = NormalizedEditor(table, chr(A))
+    print("编辑前规范码点:", describe(editor.codepoints))
+    ins = editor.insert(1, chr(M_GRAVE))
+    print("插入 grave 后 :", describe(ins.codepoints),
+          f"变化区间={ins.changed_range} 旧区间={ins.old_changed_range}",
+          f"LCP={ins.unchanged_prefix} LCS={ins.unchanged_suffix}")
+    print("  旧→新缝映射:", ins.position_map.old_to_new)
+    print("  新→旧缝映射:", ins.position_map.new_to_old)
+    print("  来源区间   :", _format_spans(ins.source_spans),
+          f"（chunk {INSERT_CHUNK_INDEX} 标记本次插入内容）")
+    assert ins.codepoints == (P_A_GRAVE,)
+
+    # 在已组合基字符之后插入 dotbelow(220)：重排后 dotbelow 成为未组合项。
+    ins2 = editor.insert(1, chr(M_DOTBELOW))
+    print("再插入 dotbelow(220) 后:", describe(ins2.codepoints))
+    print("  变化区间=", ins2.changed_range,
+          " 旧→新=", ins2.position_map.old_to_new)
+    assert ins2.codepoints == (P_A_GRAVE, M_DOTBELOW)
+
+    print()
+    print("=" * 68)
+    print("5. 按位置删除（边界：删除未组合记号后基字符保持组合态）")
+    print("-" * 68)
+    print("编辑前规范码点:", describe(editor.codepoints))
+    dele = editor.delete_range(1)  # 删除 dotbelow
+    print("删除规范串[1:2]后:", describe(dele.codepoints),
+          f"被删={describe(tuple(ord(c) for c in dele.deleted))}")
+    print("  变化区间=", dele.changed_range,
+          " 旧区间=", dele.old_changed_range,
+          " 新→旧=", dele.position_map.new_to_old)
+    assert dele.codepoints == (P_A_GRAVE,)
+
+    # 首/尾边界：删除最后一个码点。
+    tail = editor.delete_range(len(editor.text) - 1)
+    print("再删尾码点后:", describe(tail.codepoints) or "(空串)",
+          "text=", repr(editor.text))
+    assert editor.text == ""
+
+    print()
+    print("=" * 68)
+    print("6. 编辑接口的实际错误（失败且不留下半更新状态）")
+    print("-" * 68)
+    editor.set_text(chr(A) + chr(E))
+    before = editor.text
+    # 6a. 越界位置。
+    try:
+        editor.insert(9, chr(M_GRAVE))
+    except InvalidInputError as exc:
+        print(f"6a 捕获 {type(exc).__name__}: {exc}")
+    assert editor.text == before, "越界插入后状态被改动"
+    # 6b. 插入含分解环的码点（环表编辑器，真实触发表环检测），
+    #     失败后状态不变，仍可继续编辑。
+    cyc_editor = NormalizedEditor(build_cyclic_table(), chr(A) + chr(E))
+    cyc_before = cyc_editor.text
+    try:
+        cyc_editor.insert(1, chr(0xE200))
+    except DecompositionCycleError as exc:
+        print(f"6b 捕获 {type(exc).__name__}: {exc}")
+    assert cyc_editor.text == cyc_before, "环插入失败后状态被改动"
+    print("   失败后继续合法插入:", end=" ")
+    after = cyc_editor.insert(2, chr(M_GRAVE))
+    print(describe(after.codepoints))
+    assert after.codepoints == (A, E, M_GRAVE)
+
+    print()
+    print("=" * 68)
+    print("7. 拒绝边界 A：循环分解表（真实触发）")
     print("-" * 68)
     try:
         normalize([chr(0xE200)], build_cyclic_table())
@@ -106,7 +178,7 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("5. 拒绝边界 B：单段超过 1024 码点上限（真实触发）")
+    print("8. 拒绝边界 B：单段超过 1024 码点上限（真实触发）")
     print("-" * 68)
     # 一个 starter + 1024 个非 starter，分解后单段为 1025 个码点。
     big = 0xE400

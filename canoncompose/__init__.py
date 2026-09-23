@@ -16,6 +16,14 @@
 
 from __future__ import annotations
 
+from .editor import (
+    EditResult,
+    INSERT_CHUNK_INDEX,
+    NormalizedEditor,
+    PositionMap,
+    delete_text,
+    insert_text,
+)
 from .engine import (
     DEFAULT_SEGMENT_LIMIT,
     NormalizationResult,
@@ -41,6 +49,12 @@ __all__ = [
     "SourceSpan",
     "StreamNormalizer",
     "normalize",
+    "NormalizedEditor",
+    "EditResult",
+    "PositionMap",
+    "INSERT_CHUNK_INDEX",
+    "insert_text",
+    "delete_text",
     "CharacterTable",
     "DictCharacterTable",
     "validate_codepoint",
@@ -51,4 +65,4 @@ __all__ = [
     "SegmentLimitError",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

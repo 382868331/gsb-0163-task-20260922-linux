@@ -2,7 +2,8 @@
 
 离线文本基础设施可复用模块：在**调用方显式提供的有限字符表**上执行
 递归分解 → canonical combining class（ccc）稳定排序 → 阻塞二元组合，
-支持跨 chunk 流式处理、来源区间追踪与段长度上限拒绝。
+支持跨 chunk 流式处理、来源区间追踪与段长度上限拒绝；并提供在规范文本上
+**按码点位置插入/删除、重规范化并输出变化区间与新旧来源映射**的编辑接口。
 
 **不读取、不引用系统 Unicode 数据库，不绑定任何 Unicode 版本。**
 本模块只实现本题契约描述的有限算法子集，**不宣称与 Unicode
@@ -17,10 +18,10 @@ NFC/NFD 等行业标准完整兼容**。
 ## 准确命令
 
 ```bash
-# 必要测试（44 个）
+# 必要测试（83 个：原规范化 44 + 编辑接口 39）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（现场计算，约 2 ms，远小于 8 秒预算；无 sleep、无预录）
+# 固定输入演示（现场计算，约 2 ms，远小于 90 秒预算；无 sleep、无预录）
 python demo.py
 ```
 
@@ -32,6 +33,9 @@ python demo.py
 from canoncompose import (
     normalize,            # 一次性 API
     StreamNormalizer,     # 流式 API：feed / finish
+    NormalizedEditor,     # 按位置编辑：insert / delete_range / set_text
+    EditResult, PositionMap, INSERT_CHUNK_INDEX,  # 编辑返回结构
+    insert_text, delete_text,                      # 编辑的一次性便捷函数
     DictCharacterTable,   # 字典字符表
     CharacterTable,       # 字符表协议抽象基类（也可直接鸭子类型）
     NormalizationResult, SourcePoint, SourceSpan,
@@ -80,6 +84,54 @@ result = sn.finish()   # 冲刷最后一段；重复调用返回同一结果
 starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因此未闭合
 的"规范段"保留在流内部，直到遇到下一个 starter 或 `finish()` 才输出。
 
+### 按位置编辑 API（新增）
+
+在**规范文本**上按码点位置插入/删除；沿用固定字符表，做法就是题面允许的
+"全量规范化后求变化区间"：编辑前先规范化（构造时/`set_text` 时），把编辑
+施加在规范串上，编辑后把候选串**全量重新规范化**，再用最长公共前缀
+（LCP）与最长公共后缀（LCS）确定变化区间并逐输出追踪来源。
+
+```python
+editor = NormalizedEditor(table, text="", *, segment_limit=1024)
+result = editor.insert(pos, insertion)      # 在规范串码点偏移 pos 处插入
+result = editor.delete_range(start, end=None)  # 删除半开区间 [start,end)，end 缺省=start+1
+result = editor.set_text(text)              # 整体替换（同样返回映射）
+editor.text          # 当前规范串（str）
+editor.codepoints    # 当前规范串码点元组
+
+# 一次性便捷入口（无状态，内部等价于构造后单次编辑）：
+insert_text(text, pos, insertion, table)
+delete_text(text, start, end, table)        # end 可传 None
+```
+
+- 位置全部是**码点偏移**（不是字节/UTF-16 偏移），半开区间，Python 切片
+  风格；`pos` 可等于文本长度（尾缝）。插入内容自身会参与全量规范化，因此
+  插入的组合字符可能与相邻基字符/记号重排或组合，新串变化区间可能超出
+  单纯的插入点；删除后两侧内容也可能重新组合，区间同样按重规范化后的
+  LCP/LCS 重新计算。
+- 返回 `EditResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `text` / `codepoints` | 编辑并重规范化后的规范串与其码点元组 |
+| `changed_range` | **新**规范串中实际变化的半开区间 `(start, end)`（LCP 之后、LCS 之前）；无变化时 `start == end` |
+| `old_changed_range` | **旧**规范串中的变化区间（删除处；纯插入时为空区间） |
+| `unchanged_prefix` / `unchanged_suffix` | 两侧未变化码点数（即 LCP、LCS） |
+| `position_map` | `PositionMap(old_to_new, new_to_old)`：新旧规范串之间的双向**缝位置**映射，长度分别为旧/新串长度 +1 |
+| `source_spans` | 新规范串的来源区间集合：相对最近一次 `set_text`/构造输入的点记为 `chunk 0`；每次插入分别记为唯一负 chunk 下标（首次为 `INSERT_CHUNK_INDEX = -1`，再次为 `-2`、`-3`…），偏移是该次插入串内码点偏移；被删除的点不出现 |
+| `inserted` / `deleted` | 本次插入的原文 / 被删除的原规范片段（`str`） |
+
+**位置映射约定**：变化区间之前的缝恒等映射、之后的缝按长度差平移；落在
+变化区间内部的缝夹到对侧区间两条边界缝中较近者（等距归起点）。当变化
+区间在某一侧退化为空长度（纯插入/纯删除）时，两条边界缝在该侧重合成
+一条共享缝：文档起点缝（偏移 0）固定锚到起点，其余共享缝跟随其后内容
+锚到对侧区间终点。映射保序、首尾边界相互锚定；变化区之外的缝往返恒等。
+一侧文档被整体删空时，该侧唯一的缝（首=尾）锚定对侧文档原点 0。
+
+**原子性**：`insert` / `delete_range` / `set_text` 任何一步失败（非法位置、
+类型错误、插入串触发表环/非法返回值/超段上限）都直接抛异常，编辑器的
+文本、码点与来源状态保持调用前不变，可继续使用，不留下半更新状态。
+
 ## 算法与阻塞规则（契约）
 
 1. **递归分解**：沿一步分解迭代 DFS 展开到叶子；检测到回到当前 DFS
@@ -124,7 +176,12 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
   同样拒绝。非法输入不静默纠正。
 - **原子性**：`feed()` 中途任一步失败，本次 feed 对段缓冲、已输出缓冲、
   流偏移、chunk 计数的修改全部回滚，流恢复到调用前状态，可继续使用；
-  `normalize()` 不返回部分结果（成功或抛异常）。
+  `normalize()` 不返回部分结果（成功或抛异常）。编辑接口
+  （`insert`/`delete_range`/`set_text`）同样原子：失败时编辑器文本、码点
+  与来源状态完全不变；位置参数（`pos`/`start`/`end`）必须是非负 `int`，
+  拒绝 `bool` 与 `NaN`/`Infinity` 浮点，越界（`pos > len(text)`、
+  `end > len(text)`、`start > end`）抛 `InvalidInputError`，插入串必须是
+  `str`。
 - 本算法**没有搜索预算/无解证明**之类概念（确定性结构变换），因此不
   存在"预算耗尽 vs 无解"的区分需求；能失败的情形都是显式非法输入/表/
   上限，错误类型如上分开。
@@ -157,6 +214,11 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 - 来源区间以输入 chunk 的码点偏移表示；surrogate/编码层问题不存在
   （输入是 Python `str`，按码点遍历）。
 - 超长单段（如单个分解出 1025+ 叶子的码点）直接拒绝，不做降级输出。
+- 编辑接口按题面采用**编辑后全量重规范化**，未做局部重扫复杂度优化；
+  变化区间由 LCP/LCS 码点比较得出。位置是相对**规范串**的码点位置：
+  规范串中的预组合字符是单个码点，删除它即去掉整个组合簇，不提供
+  "只删基字符保留记号"之类的簇内编辑。连续编辑的来源坐标相对最近一次
+  `set_text` 的输入文本累积，不提供跨多次编辑的完整撤销历史。
 
 ## 目录
 
@@ -164,15 +226,19 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 canoncompose/          # 本题库
   __init__.py          # 公开接口
   engine.py            # 流式核心（分解/排序/组合/上限/原子回滚）
+  editor.py            # 按位置插入/删除（全量重规范化 + LCP/LCS 区间 + 双向映射）
   table.py             # 字符表协议与字典实现
   samples.py           # 确定性 PUA 示例表（含环表构造）
   errors.py            # 错误类型与定位字段
   validators.py        # 数值/码点校验
 tests/
-  test_normalize.py    # 必要测试（44 个）
+  test_normalize.py    # 规范化必要测试（44 个）
+  test_editor.py       # 编辑接口必要测试（39 个）
   reference.py         # 独立一次性朴素参考实现（不导入被测核心）
 demo.py                # 固定输入演示
 ```
 
 测试中的期望值来自 `tests/reference.py` 里独立编写的朴素分解-排序-组合
-实现（**不调用被测核心**）；与被测结果的往返一致只作为补充断言。
+实现（**不调用被测核心**），以及手算固定例子；编辑测试把"在参考规范串上
+拼接后再用参考实现规范化"作为独立期望，位置映射在测试内按 README 契约
+独立重建；与被测结果的往返一致只作为补充断言。

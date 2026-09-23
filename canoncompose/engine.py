@@ -389,6 +389,25 @@ class StreamNormalizer:
         return NormalizationResult(text, codepoints, tuple(spans))
 
 
+def normalize_with_sources(
+    text: str,
+    table: CharacterTable,
+    *,
+    segment_limit: int = DEFAULT_SEGMENT_LIMIT,
+) -> tuple[NormalizationResult, tuple[tuple[SourcePoint, ...], ...]]:
+    """对单个 ``str`` 全量规范化，并逐输出码点返回其来源点元组。
+
+    语义与 ``normalize([text], table)`` 完全一致；额外的来源点信息供
+    :mod:`canoncompose.editor` 的逐输出来源追踪使用（``NormalizationResult``
+    只暴露合并后的来源区间集合，丢失了"哪个输出来自哪些输入点"的对应）。
+    失败时（非法输入/表/环/超段上限）直接抛异常，不返回部分结果。
+    """
+    stream = StreamNormalizer(table, segment_limit=segment_limit)
+    stream.feed(text)
+    result = stream.finish()
+    return result, tuple(origins for _, origins in stream._out)
+
+
 def normalize(
     chunks: Iterable[str],
     table: CharacterTable,
