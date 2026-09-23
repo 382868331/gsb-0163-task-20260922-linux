@@ -4,9 +4,12 @@
 
     normalize(chunks, table, *, segment_limit=1024) -> NormalizationResult
     StreamNormalizer(table, *, segment_limit=1024)  # feed/finish 流式 API
+    normalize_insert(chunks, offset, text, table, *, segment_limit=1024)
+    normalize_delete(chunks, start, end, table, *, segment_limit=1024)
     DictCharacterTable(...)                          # 字典字符表
     CharacterTable                                   # 字符表协议基类
     NormalizationResult / SourcePoint / SourceSpan   # 结果数据结构
+    EditResult / EditMapping                         # 编辑结果与新旧映射
     CanonicalError / InvalidInputError / InvalidTableError /
         DecompositionCycleError / SegmentLimitError  # 错误类型
 
@@ -16,6 +19,7 @@
 
 from __future__ import annotations
 
+from .edits import EditMapping, EditResult, normalize_delete, normalize_insert
 from .engine import (
     DEFAULT_SEGMENT_LIMIT,
     NormalizationResult,
@@ -41,6 +45,10 @@ __all__ = [
     "SourceSpan",
     "StreamNormalizer",
     "normalize",
+    "normalize_insert",
+    "normalize_delete",
+    "EditResult",
+    "EditMapping",
     "CharacterTable",
     "DictCharacterTable",
     "validate_codepoint",
@@ -51,4 +59,4 @@ __all__ = [
     "SegmentLimitError",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

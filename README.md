@@ -2,7 +2,8 @@
 
 离线文本基础设施可复用模块：在**调用方显式提供的有限字符表**上执行
 递归分解 → canonical combining class（ccc）稳定排序 → 阻塞二元组合，
-支持跨 chunk 流式处理、来源区间追踪与段长度上限拒绝。
+支持跨 chunk 流式处理、来源区间追踪、段长度上限拒绝，以及按字符位置
+插入/删除后全量重扫并给出新旧映射的编辑接口。
 
 **不读取、不引用系统 Unicode 数据库，不绑定任何 Unicode 版本。**
 本模块只实现本题契约描述的有限算法子集，**不宣称与 Unicode
@@ -17,10 +18,10 @@ NFC/NFD 等行业标准完整兼容**。
 ## 准确命令
 
 ```bash
-# 必要测试（44 个）
+# 必要测试（70 个）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（现场计算，约 2 ms，远小于 8 秒预算；无 sleep、无预录）
+# 固定输入演示（现场计算，约 2 ms，远小于 90 秒预算；无 sleep、无预录）
 python demo.py
 ```
 
@@ -32,9 +33,12 @@ python demo.py
 from canoncompose import (
     normalize,            # 一次性 API
     StreamNormalizer,     # 流式 API：feed / finish
+    normalize_insert,     # 编辑 API：按字符位置插入
+    normalize_delete,     # 编辑 API：按字符位置删除
     DictCharacterTable,   # 字典字符表
     CharacterTable,       # 字符表协议抽象基类（也可直接鸭子类型）
     NormalizationResult, SourcePoint, SourceSpan,
+    EditResult, EditMapping,
     CanonicalError, InvalidInputError, InvalidTableError,
     DecompositionCycleError, SegmentLimitError,
 )
@@ -79,6 +83,40 @@ result = sn.finish()   # 冲刷最后一段；重复调用返回同一结果
 
 starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因此未闭合
 的"规范段"保留在流内部，直到遇到下一个 starter 或 `finish()` 才输出。
+
+### 编辑 API（按字符位置插入/删除）
+
+```python
+edit = normalize_insert(chunks, offset, text, table, *, segment_limit=1024)
+edit = normalize_delete(chunks, start, end, table, *, segment_limit=1024)
+```
+
+- 位置是**原始输入** chunks 拼接串上的码点偏移（与 chunk 划分无关）：
+  插入要求 `0 <= offset <= 总长度`；删除要求 `0 <= start <= end <=
+  总长度`。`text` 必须是 `str`（`""` 为合法空操作），`start == end`
+  也是合法空操作。
+- 编辑应用于原始输入（不是规范串），然后用**同一字符表**对编辑后输入
+  **全量重新规范化**，因此组合、ccc 重排、阻塞解除都按核心规则自然
+  生效（例如在 starter 后插入组合记号会触发组合，删除同 ccc 的阻塞
+  记号会解除阻塞）。
+- 返回 `EditResult`：
+  - `result` / `previous`：编辑后/前的 `NormalizationResult`；
+  - `old_span` / `new_span`：变化区间，旧/新规范输出码点序列上的半开
+    区间 `(start, end)`，由新旧输出做**公共前缀 + 公共后缀裁剪**得到，
+    单次局部编辑下即最小变化区间，完全确定（不做模糊匹配）；
+  - `mapping: EditMapping`：`new_to_old[i]` 给出新输出第 `i` 个码点
+    对应的旧输出下标（无对应为 `None`，如组合产物或新引入内容），
+    `old_to_new[j]` 反之；两者互为部分逆映射，映射恰好覆盖变化区间
+    之外（前缀恒等、后缀平移）；
+  - `changed`：规范输出是否发生变化的布尔快捷属性。
+- 编辑后输入的 chunk 划分保留原边界、在编辑点切开（插入文本自成一个
+  chunk，切出的空半片不保留），因此 `result.source_spans` 的
+  `chunk_index` 相对**编辑后**的 chunk 序列计数；新旧对应请用
+  `mapping`，不要直接比较两个结果的 `chunk_index`。
+- 非法位置/类型抛 `InvalidInputError`（拒绝 bool、NaN/Infinity、越界、
+  `start > end`、非 str 的 text/chunk）；字符表与段上限问题沿用核心
+  错误类型。两个函数都是**无状态**的：失败即抛异常，不存在半更新状态，
+  同一批输入可立即重试。
 
 ## 算法与阻塞规则（契约）
 
@@ -157,6 +195,11 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 - 来源区间以输入 chunk 的码点偏移表示；surrogate/编码层问题不存在
   （输入是 Python `str`，按码点遍历）。
 - 超长单段（如单个分解出 1025+ 叶子的码点）直接拒绝，不做降级输出。
+- 编辑接口每次调用都对编辑后输入**全量**重新规范化（本题面明确允许），
+  不做局部重扫；变化区间由公共前后缀裁剪得到，对"重复内容中部编辑"
+  这类对齐不唯一的情形，确定性地把相同前后缀算作未变化部分。
+- 编辑位置相对**原始输入**计，不相对规范串；需要先规范化再定位的
+  场景由调用方自行换算。
 
 ## 目录
 
@@ -164,12 +207,14 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 canoncompose/          # 本题库
   __init__.py          # 公开接口
   engine.py            # 流式核心（分解/排序/组合/上限/原子回滚）
+  edits.py             # 按字符位置插入/删除 + 变化区间与新旧映射
   table.py             # 字符表协议与字典实现
   samples.py           # 确定性 PUA 示例表（含环表构造）
   errors.py            # 错误类型与定位字段
   validators.py        # 数值/码点校验
 tests/
-  test_normalize.py    # 必要测试（44 个）
+  test_normalize.py    # 核心必要测试（44 个）
+  test_edits.py        # 编辑接口测试（26 个）
   reference.py         # 独立一次性朴素参考实现（不导入被测核心）
 demo.py                # 固定输入演示
 ```

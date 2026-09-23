@@ -11,8 +11,11 @@
    结果一致；
 3. 对规范串再规范化一次，验证幂等；
 4. 打印输出来源区间集合；
-5. 边界演示（真实触发、非预录）：循环分解表触发 DecompositionCycleError；
-   单段 1025 码点触发 SegmentLimitError。
+5. 按字符位置编辑：插入组合记号触发组合、首部边界插入、跨 chunk 删除，
+   打印变化区间与新旧下标映射；
+6. 边界演示（真实触发、非预录）：循环分解表触发 DecompositionCycleError；
+   单段 1025 码点触发 SegmentLimitError；编辑位置越界触发
+   InvalidInputError。
 
 所有结果都是现场计算，不使用 sleep 或预录结果。
 """
@@ -23,9 +26,12 @@ import time
 
 from canoncompose import (
     DecompositionCycleError,
+    InvalidInputError,
     SegmentLimitError,
     StreamNormalizer,
     normalize,
+    normalize_delete,
+    normalize_insert,
 )
 from canoncompose.samples import (
     A,
@@ -47,6 +53,16 @@ def _format_spans(spans) -> str:
     return ", ".join(
         f"chunk {s.chunk_index}[{s.start}:{s.end}]" for s in spans
     ) or "(空)"
+
+
+def _format_mapping(edit) -> str:
+    def side(values):
+        return "(" + ", ".join("·" if v is None else str(v) for v in values) + ")"
+
+    return (
+        f"new→old {side(edit.mapping.new_to_old)}  "
+        f"old→new {side(edit.mapping.old_to_new)}"
+    )
 
 
 def main() -> None:
@@ -95,7 +111,39 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("4. 拒绝边界 A：循环分解表（真实触发）")
+    print("4. 按字符位置编辑：插入/删除后全量重新规范化 + 新旧映射")
+    print("-" * 68)
+    # 4a. 正常：在 "ae" 偏移 1 处插入 grave(230)，与 a 组合为 P_A_GRAVE。
+    edit = normalize_insert(["ae"], 1, chr(M_GRAVE), table)
+    print("插入 grave 到 'ae' 偏移 1:")
+    print("  旧规范码点:", describe(edit.previous.codepoints))
+    print("  新规范码点:", describe(edit.result.codepoints))
+    print(f"  变化区间 old{edit.old_span} new{edit.new_span}")
+    print(" ", _format_mapping(edit))
+
+    # 4b. 边界：首部插入前导记号（永不组合）与跨 chunk 删除。
+    edit_head = normalize_insert(["a"], 0, chr(M_GRAVE), table)
+    print("首部边界：插入 grave 到 'a' 偏移 0（前导记号不组合）:")
+    print("  新规范码点:", describe(edit_head.result.codepoints))
+    print(f"  变化区间 old{edit_head.old_span} new{edit_head.new_span}")
+    print(" ", _format_mapping(edit_head))
+
+    edit_del = normalize_delete(["ao", "ea"], 1, 3, table)
+    print("跨 chunk 删除：['ao','ea'] 删除拼接串 [1,3)（'o' 与 'e'）:")
+    print("  新规范码点:", describe(edit_del.result.codepoints))
+    print(f"  变化区间 old{edit_del.old_span} new{edit_del.new_span}")
+    print(" ", _format_mapping(edit_del))
+
+    # 4c. 实际错误：编辑位置越界（真实触发）。
+    print("编辑位置越界（真实触发）:")
+    try:
+        normalize_insert(["ae"], 3, "x", table)
+    except InvalidInputError as exc:
+        print(f"  捕获 {type(exc).__name__}: {exc}")
+
+    print()
+    print("=" * 68)
+    print("5. 拒绝边界 A：循环分解表（真实触发）")
     print("-" * 68)
     try:
         normalize([chr(0xE200)], build_cyclic_table())
@@ -106,7 +154,7 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("5. 拒绝边界 B：单段超过 1024 码点上限（真实触发）")
+    print("6. 拒绝边界 B：单段超过 1024 码点上限（真实触发）")
     print("-" * 68)
     # 一个 starter + 1024 个非 starter，分解后单段为 1025 个码点。
     big = 0xE400
