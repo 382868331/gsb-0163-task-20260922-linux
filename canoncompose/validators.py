@@ -72,6 +72,22 @@ def validate_chunk(chunk: object, chunk_index: int) -> str:
     return chunk
 
 
+def validate_non_negative_int(value: object, name: str) -> int:
+    """校验非负整数参数（如 chunk 下标、偏移），拒绝 bool 与 NaN/Infinity。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, float):
+            if math.isnan(value):
+                raise InvalidInputError(f"{name} is NaN")
+            if math.isinf(value):
+                raise InvalidInputError(f"{name} is Infinity")
+        raise InvalidInputError(
+            f"{name} must be int, got {type(value).__name__}"
+        )
+    if value < 0:
+        raise InvalidInputError(f"{name} must be non-negative, got {value}")
+    return value
+
+
 def validate_positive_int(value: object, name: str) -> int:
     """校验正整数参数（如段上限），拒绝 bool。"""
     if isinstance(value, bool) or not isinstance(value, int):

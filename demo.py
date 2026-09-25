@@ -10,9 +10,10 @@
 2. 把同一输入按固定切点分成 3 个 chunk 流式 feed，验证分块结果与一次性
    结果一致；
 3. 对规范串再规范化一次，验证幂等；
-4. 打印输出来源区间集合；
-5. 边界演示（真实触发、非预录）：循环分解表触发 DecompositionCycleError；
-   单段 1025 码点触发 SegmentLimitError。
+4. 来源反查：输入选区 → 输出区间（含 pending 与 mixed 标记）；
+5. 边界演示（真实触发、非预录）：非法反查区间触发 InvalidInputError；
+   循环分解表触发 DecompositionCycleError；单段 1025 码点触发
+   SegmentLimitError。
 
 所有结果都是现场计算，不使用 sleep 或预录结果。
 """
@@ -23,6 +24,7 @@ import time
 
 from canoncompose import (
     DecompositionCycleError,
+    InvalidInputError,
     SegmentLimitError,
     StreamNormalizer,
     normalize,
@@ -46,6 +48,12 @@ from canoncompose.table import DictCharacterTable
 def _format_spans(spans) -> str:
     return ", ".join(
         f"chunk {s.chunk_index}[{s.start}:{s.end}]" for s in spans
+    ) or "(空)"
+
+
+def _format_output_spans(spans) -> str:
+    return ", ".join(
+        f"输出[{s.start}:{s.end}]{' mixed' if s.mixed else ''}" for s in spans
     ) or "(空)"
 
 
@@ -95,7 +103,49 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("4. 拒绝边界 A：循环分解表（真实触发）")
+    print("4. 来源反查：输入选区 → 输出区间（pending / mixed）")
+    print("-" * 68)
+    # chunk0 = a，chunk1 = grave + e：a 与 grave 跨 chunk 组合。
+    qstream = StreamNormalizer(table)
+    qstream.feed(chr(A))
+    # 只 feed 了 chunk0：'a' 还在段缓冲中等待后续记号 → 只返回 pending。
+    got = qstream.query(0, 0, 1)
+    print("feed chunk0 后 query(chunk 0, [0:1]):")
+    print("  输出区间:", _format_output_spans(got.output_spans))
+    print("  pending :", _format_spans(got.pending_spans))
+    # chunk1 的 'e' 是 starter，到达时闭合 a+grave 段并发布组合产物。
+    qstream.feed(chr(M_GRAVE) + chr(E))
+    got = qstream.query(0, 0, 1)
+    print("feed chunk1 后 query(chunk 0, [0:1])（只选 'a'）:")
+    print("  输出区间:", _format_output_spans(got.output_spans))
+    print("  pending :", _format_spans(got.pending_spans))
+    qresult = qstream.finish()
+    print("finish 后规范码点:", describe(qresult.codepoints))
+    # 只选 chunk1 的 grave：组合产物 P_A_GRAVE 混入选区外的 'a'。
+    got = qstream.query(1, 0, 1)
+    print("finish 后 query(chunk 1, [0:1])（只选 grave）:")
+    print("  输出区间:", _format_output_spans(got.output_spans))
+    # 选 chunk1 全部：P_A_GRAVE 仍 mixed，e 纯；相邻不同标志不合并。
+    got = qstream.query(1, 0, 2)
+    print("finish 后 query(chunk 1, [0:2])（grave + e）:")
+    print("  输出区间:", _format_output_spans(got.output_spans))
+
+    print()
+    print("=" * 68)
+    print("5. 拒绝边界 A：非法反查区间（真实触发）")
+    print("-" * 68)
+    try:
+        qstream.query(1, 2, 1)  # start > end
+    except InvalidInputError as exc:
+        print(f"捕获 {type(exc).__name__}: {exc}")
+    try:
+        qstream.query(1, 0, 3)  # 超出 chunk 1 长度 2
+    except InvalidInputError as exc:
+        print(f"捕获 {type(exc).__name__}: {exc}")
+
+    print()
+    print("=" * 68)
+    print("6. 拒绝边界 B：循环分解表（真实触发）")
     print("-" * 68)
     try:
         normalize([chr(0xE200)], build_cyclic_table())
@@ -106,7 +156,7 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("5. 拒绝边界 B：单段超过 1024 码点上限（真实触发）")
+    print("7. 拒绝边界 C：单段超过 1024 码点上限（真实触发）")
     print("-" * 68)
     # 一个 starter + 1024 个非 starter，分解后单段为 1025 个码点。
     big = 0xE400

@@ -2,7 +2,8 @@
 
 离线文本基础设施可复用模块：在**调用方显式提供的有限字符表**上执行
 递归分解 → canonical combining class（ccc）稳定排序 → 阻塞二元组合，
-支持跨 chunk 流式处理、来源区间追踪与段长度上限拒绝。
+支持跨 chunk 流式处理、来源区间追踪（正向：输出 → 输入来源集合；
+反向：输入选区 → 输出区间反查）与段长度上限拒绝。
 
 **不读取、不引用系统 Unicode 数据库，不绑定任何 Unicode 版本。**
 本模块只实现本题契约描述的有限算法子集，**不宣称与 Unicode
@@ -17,10 +18,10 @@ NFC/NFD 等行业标准完整兼容**。
 ## 准确命令
 
 ```bash
-# 必要测试（44 个）
+# 必要测试（68 个）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（现场计算，约 2 ms，远小于 8 秒预算；无 sleep、无预录）
+# 固定输入演示（现场计算，约 2 ms，远小于 90 秒预算；无 sleep、无预录）
 python demo.py
 ```
 
@@ -31,10 +32,11 @@ python demo.py
 ```python
 from canoncompose import (
     normalize,            # 一次性 API
-    StreamNormalizer,     # 流式 API：feed / finish
+    StreamNormalizer,     # 流式 API：feed / finish / query
     DictCharacterTable,   # 字典字符表
     CharacterTable,       # 字符表协议抽象基类（也可直接鸭子类型）
     NormalizationResult, SourcePoint, SourceSpan,
+    OutputSpan, SourceQueryResult,
     CanonicalError, InvalidInputError, InvalidTableError,
     DecompositionCycleError, SegmentLimitError,
 )
@@ -79,6 +81,58 @@ result = sn.finish()   # 冲刷最后一段；重复调用返回同一结果
 
 starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因此未闭合
 的"规范段"保留在流内部，直到遇到下一个 starter 或 `finish()` 才输出。
+
+### 来源反查（输入选区 → 输出区间）
+
+编辑器场景：已知输入中的一段选区，反查它影响哪些已发布的输出字符。
+
+```python
+from canoncompose import StreamNormalizer
+from canoncompose.samples import A, M_GRAVE, E, build_demo_table
+
+sn = StreamNormalizer(build_demo_table())
+sn.feed(chr(A))                  # chunk 0："a"
+got = sn.query(0, 0, 1)          # 'a' 仍在段缓冲 → 只有 pending
+assert got.output_spans == () and got.pending_spans[0].start == 0
+sn.feed(chr(M_GRAVE) + chr(E))   # chunk 1：'e' 闭合 a+grave 段并发布
+got = sn.query(0, 0, 1)          # 组合产物还混入 chunk 1 的 grave
+assert got.output_spans[0].mixed is True
+# got.output_spans  -> tuple[OutputSpan, ...]：与选区相交的已发布输出区间
+# got.pending_spans -> tuple[SourceSpan, ...]：选区内仍在段缓冲的输入范围
+```
+
+- `query(chunk_index, start, end)` 的选区是**单个 chunk 内**的半开区间
+  `[start, end)`，坐标沿用原 chunk 编号与 chunk 内码点偏移。
+- 返回 `SourceQueryResult`：
+  - `output_spans`：`OutputSpan(start, end, mixed)`，输出码点位置的半开
+    区间，按输出位置有序；**相邻且 `mixed` 标志相同的段已合并**。
+    `mixed=True` 表示该段字符的来源除选区外还**混入选区外的输入**
+    （组合合并不同来源、一个输入码点分解出多个输出都会如此——索引
+    不假设一对一或整体单调）。
+  - `pending_spans`：选区内仍停留在规范段缓冲（未发布）的输入范围。
+    查询**只针对已发布字符**，不会为查询冲刷段缓冲或强制 `finish`，
+    是纯查询，`finish` 前后均可调用。
+- **空区间**（`start == end`）只做合法性检查并返回空结果。
+- 非法区间抛 `InvalidInputError`：`start > end`、负数、`bool`/非整数
+  （含 NaN/Infinity）、`chunk_index` 超出已接受 chunk 数、`end` 超出
+  该 chunk 长度。失败 feed 回滚后，其 chunk 编号同样不可查询。
+- 正向索引（`NormalizationResult.source_spans`）保留不变，两者可独立
+  使用；本功能不是检查点/文本编辑重算：输入变化需新建流重新 feed。
+
+可复现路径（仓库根目录）：
+
+```bash
+python demo.py        # 第 4 节现场演示 pending 与 mixed；第 5 节演示非法区间被拒绝
+python -m unittest discover -s tests -v   # test_source_query.py 为反查测试
+```
+
+失败示例（`python demo.py` 第 5 节真实触发）：
+
+```
+捕获 InvalidInputError: chunk 1: start must be <= end, got [2, 1)
+捕获 InvalidInputError: chunk 1: range [0, 3) exceeds chunk 1 length 2
+```
+
 
 ## 算法与阻塞规则（契约）
 
@@ -145,6 +199,11 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
   固有特征。
 - 来源区间按"输出码点 → 输入来源点并集 → 同 chunk 连续点合并"计算，
   语义直观；不尝试输出字符级的多层 provenance 树。
+- 反查（`query`）复用同一份逐输出来源记录做逆向筛选：已发布输出逐
+  码点判定"命中选区 / 还混入选区外来源"，相邻同标志段合并；段缓冲中
+  的未发布输入按原坐标合并为 pending 范围。递归分解使一个输入码点可
+  产生多个输出、组合使一个输出可有多个来源，因此索引按"来源点集合"
+  判定，不假设一对一或整体单调。
 - 表查询结果（分解叶子、ccc）在单次运行内缓存：既加速重复码点，也
   保证运行内表视图一致；表在运行中途被外部修改属于未定义用法。
 
@@ -156,6 +215,9 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 - 不校验组合结果自身的 ccc 或分解一致性（表自洽性由调用方负责）。
 - 来源区间以输入 chunk 的码点偏移表示；surrogate/编码层问题不存在
   （输入是 Python `str`，按码点遍历）。
+- 反查选区限定**单个 chunk 内**的半开区间；跨 chunk 选区需逐 chunk
+  查询后自行合并。反查是只读查询，不提供增量更新：输入变化后需新建
+  流重新 feed（本库不做检查点或文本编辑重算）。
 - 超长单段（如单个分解出 1025+ 叶子的码点）直接拒绝，不做降级输出。
 
 ## 目录
@@ -163,16 +225,19 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 ```
 canoncompose/          # 本题库
   __init__.py          # 公开接口
-  engine.py            # 流式核心（分解/排序/组合/上限/原子回滚）
+  engine.py            # 流式核心（分解/排序/组合/上限/原子回滚/来源反查）
   table.py             # 字符表协议与字典实现
   samples.py           # 确定性 PUA 示例表（含环表构造）
   errors.py            # 错误类型与定位字段
   validators.py        # 数值/码点校验
 tests/
-  test_normalize.py    # 必要测试（44 个）
+  test_normalize.py    # 核心算法测试（44 个）
+  test_source_query.py # 来源反查测试（24 个）
   reference.py         # 独立一次性朴素参考实现（不导入被测核心）
 demo.py                # 固定输入演示
 ```
 
 测试中的期望值来自 `tests/reference.py` 里独立编写的朴素分解-排序-组合
-实现（**不调用被测核心**）；与被测结果的往返一致只作为补充断言。
+实现（**不调用被测核心**）：正向区间用 `reference_normalize` 交叉验证，
+反查用 `reference_query`（逐输出码点扫描来源集）交叉验证；与被测结果
+的往返一致只作为补充断言。

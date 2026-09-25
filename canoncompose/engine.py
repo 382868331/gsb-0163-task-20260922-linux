@@ -21,6 +21,10 @@
 ``feed()`` 是原子的：任一码点处理失败时，本次 feed 已造成的流状态变更
 全部回滚（段缓冲、已输出缓冲、流偏移、chunk 计数），不留下未说明的
 部分变更。
+
+``query()`` 提供来源反查：输入单 chunk 内半开区间，返回与选区相交的
+已发布输出区间（标明是否混入选区外来源），选区内仍在段缓冲中的输入
+以 pending 范围单独返回；查询为纯操作，不冲刷段缓冲、不强制 finish。
 """
 
 from __future__ import annotations
@@ -35,11 +39,18 @@ from .errors import (
     SegmentLimitError,
 )
 from .table import CharacterTable
-from .validators import MAX_CODEPOINT, validate_chunk, validate_positive_int
+from .validators import (
+    MAX_CODEPOINT,
+    validate_chunk,
+    validate_non_negative_int,
+    validate_positive_int,
+)
 
 __all__ = [
     "SourcePoint",
     "SourceSpan",
+    "OutputSpan",
+    "SourceQueryResult",
     "NormalizationResult",
     "StreamNormalizer",
     "normalize",
@@ -65,6 +76,34 @@ class SourceSpan:
     chunk_index: int
     start: int
     end: int
+
+
+@dataclass(frozen=True)
+class OutputSpan:
+    """与输入选区相交的输出半开区间 ``[start, end)``（输出码点位置）。
+
+    ``mixed`` 为 ``True`` 表示该段内字符的来源除选区外还混入了**选区外**
+    的输入码点（组合合并不同来源、或一个输入码点分解出多个输出时都会
+    出现）。相邻且 ``mixed`` 标志相同的输出位置已合并为一段。
+    """
+
+    start: int
+    end: int
+    mixed: bool
+
+
+@dataclass(frozen=True)
+class SourceQueryResult:
+    """输入选区反查结果（见 :meth:`StreamNormalizer.query`）。
+
+    - ``output_spans``：已发布输出中与选区相交的区间，按输出位置有序；
+    - ``pending_spans``：选区内仍停留在规范段缓冲（尚未发布）的输入
+      半开区间，按 ``(chunk_index, start)`` 有序、连续点已合并。
+      查询不会为拿到这些范围而冲刷段缓冲或 ``finish``。
+    """
+
+    output_spans: tuple[OutputSpan, ...]
+    pending_spans: tuple[SourceSpan, ...]
 
 
 @dataclass(frozen=True)
@@ -148,6 +187,8 @@ class StreamNormalizer:
         self._out: list[_Entry] = []
         self._stream_pos = 0
         self._chunk_count = 0
+        # 每个已接受 chunk 的码点长度（与 chunk 编号一一对应），供反查校验。
+        self._chunk_lengths: list[int] = []
         self._finished = False
         self._result: NormalizationResult | None = None
 
@@ -339,6 +380,7 @@ class StreamNormalizer:
         try:
             chunk_index = self._chunk_count
             self._chunk_count += 1
+            self._chunk_lengths.append(len(chunk))
             for offset, ch in enumerate(chunk):
                 point = SourcePoint(chunk_index, offset, self._stream_pos)
                 self._stream_pos += 1
@@ -352,6 +394,7 @@ class StreamNormalizer:
             del self._out[backup_out_len:]
             self._stream_pos = backup_pos
             self._chunk_count = backup_chunk_count
+            del self._chunk_lengths[backup_chunk_count:]
             raise
 
     def finish(self) -> NormalizationResult:
@@ -365,6 +408,78 @@ class StreamNormalizer:
         self._result = self._build_result()
         self._finished = True
         return self._result
+
+    def query(
+        self, chunk_index: int, start: int, end: int
+    ) -> SourceQueryResult:
+        """来源反查：输入选区 ``chunk[chunk_index][start:end]`` → 输出区间。
+
+        返回所有与选区有交集的**已发布**输出字符区间（:class:`OutputSpan`，
+        按输出位置有序，连续且 ``mixed`` 标志相同的段已合并）；``mixed``
+        标明该段是否还混入选区外的来源。选区内仍停留在规范段缓冲中的输入
+        以 ``pending_spans`` 单独返回。
+
+        本方法是纯查询：不冲刷段缓冲、不推进流状态、不要求也不触发
+        ``finish``，``finish`` 前后均可调用。空区间（``start == end``）
+        只做合法性检查并返回空结果。坐标沿用原 chunk 编号与 chunk 内偏移。
+        """
+        ci = validate_non_negative_int(chunk_index, "chunk_index")
+        lo = validate_non_negative_int(start, "start")
+        hi = validate_non_negative_int(end, "end")
+        if lo > hi:
+            raise InvalidInputError(
+                f"start must be <= end, got [{lo}, {hi})", chunk_index=ci
+            )
+        if ci >= self._chunk_count:
+            raise InvalidInputError(
+                f"chunk_index {ci} out of range, "
+                f"{self._chunk_count} chunk(s) fed so far",
+                chunk_index=ci,
+            )
+        if hi > self._chunk_lengths[ci]:
+            raise InvalidInputError(
+                f"range [{lo}, {hi}) exceeds chunk {ci} length "
+                f"{self._chunk_lengths[ci]}",
+                chunk_index=ci,
+            )
+        if lo == hi:
+            # 空区间：合法性检查完成，直接返回空结果。
+            return SourceQueryResult((), ())
+
+        def selected(p: SourcePoint) -> bool:
+            return p.chunk_index == ci and lo <= p.offset < hi
+
+        spans: list[OutputSpan] = []
+        for pos, (_cp, origins) in enumerate(self._out):
+            hits = [selected(p) for p in origins]
+            if not any(hits):
+                continue
+            mixed = not all(hits)
+            if spans and spans[-1].end == pos and spans[-1].mixed == mixed:
+                prev = spans[-1]
+                spans[-1] = OutputSpan(prev.start, pos + 1, mixed)
+            else:
+                spans.append(OutputSpan(pos, pos + 1, mixed))
+
+        # 段缓冲中的叶子条目各自携带单一来源点（组合发生在段闭合时），
+        # 与选区求交后按输入坐标合并连续点。
+        points = {
+            p for _cp, origins in self._seg for p in origins if selected(p)
+        }
+        pending: list[SourceSpan] = []
+        for p in sorted(points, key=lambda q: (q.chunk_index, q.offset)):
+            if (
+                pending
+                and pending[-1].chunk_index == p.chunk_index
+                and pending[-1].end == p.offset
+            ):
+                prev = pending[-1]
+                pending[-1] = SourceSpan(
+                    prev.chunk_index, prev.start, p.offset + 1
+                )
+            else:
+                pending.append(SourceSpan(p.chunk_index, p.offset, p.offset + 1))
+        return SourceQueryResult(tuple(spans), tuple(pending))
 
     def _build_result(self) -> NormalizationResult:
         codepoints = tuple(cp for cp, _ in self._out)

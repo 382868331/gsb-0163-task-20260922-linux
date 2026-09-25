@@ -40,8 +40,8 @@ def _naive_compose(segment, table, ccc_of):
     return [base, *pending]
 
 
-def reference_normalize(chunks, table):
-    """一次性返回 (码点元组, 来源点元组)。
+def _run(chunks, table):
+    """一次性朴素规范化，返回 (码点元组, 每个输出码点的来源点集合元组)。
 
     来源点为 ``(chunk_index, offset, stream_offset)``。
     """
@@ -121,6 +121,15 @@ def reference_normalize(chunks, table):
         for i in keep:
             out_cps.append(cps[i])
             out_points.append(frozenset(bag[i]))
+    return tuple(out_cps), tuple(out_points)
+
+
+def reference_normalize(chunks, table):
+    """一次性返回 (码点元组, 来源区间元组)。
+
+    来源区间为 ``(chunk_index, start, end)`` 半开区间，连续点已合并。
+    """
+    out_cps, out_points = _run(chunks, table)
 
     # 展平来源点并合并同 chunk 连续偏移（独立复算区间集合）。
     all_points = set()
@@ -132,4 +141,27 @@ def reference_normalize(chunks, table):
             spans[-1] = (ci, spans[-1][1], off + 1)
         else:
             spans.append((ci, off, off + 1))
-    return tuple(out_cps), tuple(spans)
+    return out_cps, tuple(spans)
+
+
+def reference_query(chunks, table, chunk_index, start, end):
+    """反查参照：逐输出码点扫描来源集，返回 (start, end, mixed) 元组。
+
+    一次性参考没有"未发布"概念（相当于已 finish），因此只产出输出区间；
+    合并规则与被测契约一致：相邻且 mixed 标志相同的输出位置并为一段。
+    """
+    _out_cps, out_points = _run(chunks, table)
+    spans = []
+    for pos, bag in enumerate(out_points):
+        hits = [
+            ci == chunk_index and start <= off < end
+            for ci, off, _so in bag
+        ]
+        if not any(hits):
+            continue
+        mixed = not all(hits)
+        if spans and spans[-1][1] == pos and spans[-1][2] == mixed:
+            spans[-1] = (spans[-1][0], pos + 1, mixed)
+        else:
+            spans.append((pos, pos + 1, mixed))
+    return tuple(spans)
