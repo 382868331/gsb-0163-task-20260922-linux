@@ -13,6 +13,7 @@ __all__ = [
     "InvalidTableError",
     "DecompositionCycleError",
     "SegmentLimitError",
+    "CheckpointError",
 ]
 
 
@@ -135,3 +136,13 @@ class SegmentLimitError(CanonicalError):
         self.offset = offset
         self.stream_offset = stream_offset
         self.codepoint = codepoint
+
+
+class CheckpointError(CanonicalError, ValueError):
+    """检查点导出/恢复失败。
+
+    覆盖：当前字符表不支持检查点（非 :class:`DictCharacterTable`）、
+    检查点格式/版本不认识、字段或来源坐标不合法、以及恢复时调用方
+    传入的字符表指纹与导出时不匹配。恢复在校验全部通过前不构造
+    任何对象，因此失败不会留下半恢复对象。
+    """

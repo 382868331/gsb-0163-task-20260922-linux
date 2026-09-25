@@ -25,7 +25,26 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Mapping
 
+from .errors import InvalidTableError
+from .validators import MAX_CODEPOINT
+
 __all__ = ["CharacterTable", "DictCharacterTable"]
+
+
+def _check_rule_codepoint(value: object, *, owner: int | None) -> int:
+    """校验规则表里的码点（键或值），非法时抛 InvalidTableError。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidTableError(
+            f"table rule codepoint must be int, got {type(value).__name__}",
+            codepoint=owner,
+        )
+    if value < 0 or value > MAX_CODEPOINT:
+        raise InvalidTableError(
+            f"table rule codepoint out of range 0..0x{MAX_CODEPOINT:X}, "
+            f"got U+{value:X}",
+            codepoint=owner,
+        )
+    return value
 
 
 class CharacterTable(ABC):
@@ -70,3 +89,64 @@ class DictCharacterTable(CharacterTable):
 
     def composition(self, left: int, right: int) -> int | None:
         return self._comp.get((left, right))
+
+    def canonical_rules(self) -> dict:
+        """返回三项有限规则的规范排序表示（JSON 兼容）。
+
+        规则按键排序、每项内部顺序固定，因此**内容相同**（与构造时的
+        插入顺序无关）的两个 ``DictCharacterTable`` 必然得到相同表示；
+        内容不同则表示不同。供检查点指纹使用，见
+        :meth:`canoncompose.engine.StreamNormalizer.export_checkpoint`。
+
+        表示中所有码点/ccc 都经过校验；表内容非法时抛
+        :class:`~canoncompose.errors.InvalidTableError`。
+        """
+        decomp: list[tuple[int, tuple[int, ...]]] = []
+        for cp, children in self._decomp.items():
+            _check_rule_codepoint(cp, owner=None)
+            if not isinstance(children, tuple) or len(children) == 0:
+                raise InvalidTableError(
+                    "decomposition rule must map to a non-empty tuple, "
+                    f"got {children!r}",
+                    codepoint=cp,
+                )
+            decomp.append(
+                (cp, tuple(_check_rule_codepoint(c, owner=cp) for c in children))
+            )
+
+        ccc_items: list[tuple[int, int]] = []
+        for cp, ccc in self._ccc.items():
+            _check_rule_codepoint(cp, owner=None)
+            if isinstance(ccc, bool) or not isinstance(ccc, int) or ccc < 0:
+                raise InvalidTableError(
+                    f"combining class must be a non-negative int, got {ccc!r}",
+                    codepoint=cp,
+                )
+            ccc_items.append((cp, ccc))
+
+        comp_items: list[tuple[int, int, int]] = []
+        for pair, result in self._comp.items():
+            if (
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not all(isinstance(p, int) and not isinstance(p, bool) for p in pair)
+            ):
+                raise InvalidTableError(
+                    f"composition rule key must be a (left, right) int pair, "
+                    f"got {pair!r}"
+                )
+            left, right = pair
+            _check_rule_codepoint(left, owner=None)
+            _check_rule_codepoint(right, owner=None)
+            _check_rule_codepoint(result, owner=left)
+            comp_items.append((left, right, result))
+
+        return {
+            "decompositions": [
+                [cp, list(children)] for cp, children in sorted(decomp)
+            ],
+            "combining_classes": [[cp, ccc] for cp, ccc in sorted(ccc_items)],
+            "compositions": [
+                [left, right, result] for left, right, result in sorted(comp_items)
+            ],
+        }

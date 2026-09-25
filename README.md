@@ -17,26 +17,29 @@ NFC/NFD 等行业标准完整兼容**。
 ## 准确命令
 
 ```bash
-# 必要测试（44 个）
+# 必要测试（69 个）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（现场计算，约 2 ms，远小于 8 秒预算；无 sleep、无预录）
 python demo.py
+
+# 检查点演示：暂停 → JSON → 另一个真实子进程恢复 → 表不匹配拒绝（约 0.2 秒）
+python demo_checkpoint.py
 ```
 
-两条命令均在仓库根目录执行。
+三条命令均在仓库根目录执行。
 
 ## 公开接口
 
 ```python
 from canoncompose import (
     normalize,            # 一次性 API
-    StreamNormalizer,     # 流式 API：feed / finish
+    StreamNormalizer,     # 流式 API：feed / finish / export_checkpoint / restore_checkpoint
     DictCharacterTable,   # 字典字符表
     CharacterTable,       # 字符表协议抽象基类（也可直接鸭子类型）
     NormalizationResult, SourcePoint, SourceSpan,
     CanonicalError, InvalidInputError, InvalidTableError,
-    DecompositionCycleError, SegmentLimitError,
+    DecompositionCycleError, SegmentLimitError, CheckpointError,
 )
 ```
 
@@ -79,6 +82,42 @@ result = sn.finish()   # 冲刷最后一段；重复调用返回同一结果
 
 starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因此未闭合
 的"规范段"保留在流内部，直到遇到下一个 starter 或 `finish()` 才输出。
+
+### 检查点（暂停 / 恢复）
+
+文本导入被暂停时，可以把流状态导出为**带版本的 JSON 兼容检查点**，
+之后（包括在另一个进程里）恢复并接着喂剩余 chunks：
+
+```python
+sn = StreamNormalizer(table)
+sn.feed(chunk1)
+checkpoint = sn.export_checkpoint()      # dict，可 json.dumps 落盘/传输
+# ……另一个进程、另一次运行……
+sn2 = StreamNormalizer.restore_checkpoint(json.loads(text), table)
+sn2.feed(chunk2)                          # chunk 编号、流偏移接着走
+result = sn2.finish()
+```
+
+契约要点：
+
+- **未闭合的规范段原样保留**：导出**不会**暗中 `finish()`；下一块字符
+  仍可改变已挂起段的组合与排序。恢复后续喂的结果、来源区间、chunk
+  编号与从头连续处理完全一致（测试对每个 chunk 边界逐一验证）。
+- **已 `finish()` 的状态也允许导出**；恢复后保持结束语义（`finish`
+  幂等返回同一结果，`feed` 抛 `InvalidInputError`）。
+- **仅支持 `DictCharacterTable`**：导出时把其有限规则（分解/ccc/组合
+  三张映射）规范排序后计算 SHA-256 指纹写入检查点；恢复时调用方必须
+  传入**内容相同**的表（与插入顺序无关），指纹不匹配即抛
+  `CheckpointError`。自定义字符表的正常处理不受影响，只是调用
+  `export_checkpoint` / 作为恢复目标会被拒绝。
+- **JSON 兼容、无 pickle、无对象地址**：检查点只含 int/str/bool/
+  list/dict；字符表不随检查点序列化，由调用方在恢复时重新提供。
+- **导出数据是全新对象**：调用方修改导出结果不会反过来影响活对象。
+- **失败不留半恢复对象**：格式标签/版本不认识、字段或来源坐标（chunk
+  编号、chunk 内偏移、流偏移）不合法、表类型不支持或指纹不匹配，都在
+  构造任何对象之前抛 `CheckpointError`（`CanonicalError` 子类）。
+- 展开/ccc 缓存属于可重算的纯增益，不写入检查点；恢复后按同内容表
+  重新推导，结果一致。
 
 ## 算法与阻塞规则（契约）
 
@@ -157,21 +196,27 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 - 来源区间以输入 chunk 的码点偏移表示；surrogate/编码层问题不存在
   （输入是 Python `str`，按码点遍历）。
 - 超长单段（如单个分解出 1025+ 叶子的码点）直接拒绝，不做降级输出。
+- 检查点仅支持 `DictCharacterTable`；表内容本身不随检查点传输（只存
+  指纹），恢复方必须自己持有同内容的表。检查点格式有版本号，跨版本
+  不保证兼容（不认识的版本直接拒绝）。
 
 ## 目录
 
 ```
 canoncompose/          # 本题库
   __init__.py          # 公开接口
-  engine.py            # 流式核心（分解/排序/组合/上限/原子回滚）
-  table.py             # 字符表协议与字典实现
+  engine.py            # 流式核心（分解/排序/组合/上限/原子回滚/检查点）
+  table.py             # 字符表协议与字典实现（含规范排序规则表示）
   samples.py           # 确定性 PUA 示例表（含环表构造）
   errors.py            # 错误类型与定位字段
   validators.py        # 数值/码点校验
 tests/
-  test_normalize.py    # 必要测试（44 个）
+  test_normalize.py    # 核心算法测试
+  test_checkpoint.py   # 检查点测试（含真实子进程传 JSON）
+  _checkpoint_worker.py# 子进程助手（被测试以子进程方式调用）
   reference.py         # 独立一次性朴素参考实现（不导入被测核心）
 demo.py                # 固定输入演示
+demo_checkpoint.py     # 检查点演示（暂停/跨进程恢复/表不匹配拒绝）
 ```
 
 测试中的期望值来自 `tests/reference.py` 里独立编写的朴素分解-排序-组合

@@ -21,20 +21,37 @@
 ``feed()`` 是原子的：任一码点处理失败时，本次 feed 已造成的流状态变更
 全部回滚（段缓冲、已输出缓冲、流偏移、chunk 计数），不留下未说明的
 部分变更。
+
+检查点（暂停/恢复）
+-------------------
+
+:meth:`StreamNormalizer.export_checkpoint` 把当前流状态导出为**带版本的
+JSON 兼容 dict**（纯 int/str/bool/list/dict，无 pickle、无对象地址），
+可在另一个进程里由 :meth:`StreamNormalizer.restore_checkpoint` 恢复后继续
+``feed``。未闭合的规范段原样保留——导出**不会**暗中 ``finish``。
+
+该功能仅支持 :class:`~canoncompose.table.DictCharacterTable`：导出时把其
+有限规则规范排序后计算 SHA-256 指纹写入检查点；恢复时调用方必须传入
+**内容相同**的表（按同一规范表示比对指纹），内容不同即拒绝。自定义
+字符表的正常处理不受影响，只是不支持检查点保存。已 ``finish`` 的状态
+同样允许导出，恢复后保持结束语义（``finish`` 幂等、``feed`` 拒绝）。
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
 from .errors import (
+    CheckpointError,
     DecompositionCycleError,
     InvalidInputError,
     InvalidTableError,
     SegmentLimitError,
 )
-from .table import CharacterTable
+from .table import CharacterTable, DictCharacterTable
 from .validators import MAX_CODEPOINT, validate_chunk, validate_positive_int
 
 __all__ = [
@@ -44,9 +61,17 @@ __all__ = [
     "StreamNormalizer",
     "normalize",
     "DEFAULT_SEGMENT_LIMIT",
+    "CHECKPOINT_FORMAT",
+    "CHECKPOINT_VERSION",
 ]
 
 DEFAULT_SEGMENT_LIMIT = 1024
+
+#: 检查点数据的格式标签。
+CHECKPOINT_FORMAT = "canoncompose-checkpoint"
+
+#: 当前支持的检查点格式版本。
+CHECKPOINT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -113,6 +138,98 @@ def _cycle_chain(stack: list[_Frame], repeated: int) -> tuple[int, ...]:
     chain = [frame[0] for frame in stack[start:]]
     chain.append(repeated)
     return tuple(chain)
+
+
+# ---- 检查点：序列化与校验 -----------------------------------------------
+
+def _table_fingerprint(table: DictCharacterTable) -> str:
+    """对表的有限规则规范排序表示计算 SHA-256 指纹。"""
+    canonical = table.canonical_rules()
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _dump_entries(entries: list[_Entry]) -> list[dict]:
+    """把内部条目列表转成 JSON 兼容结构（全新对象，不与流状态共享）。"""
+    return [
+        {
+            "cp": cp,
+            "origins": [
+                [p.chunk_index, p.offset, p.stream_offset] for p in origins
+            ],
+        }
+        for cp, origins in entries
+    ]
+
+
+def _ck_int(value: object, name: str, *, minimum: int = 0) -> int:
+    """校验检查点里的整数字段（拒绝 bool），非法抛 CheckpointError。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise CheckpointError(
+            f"checkpoint field {name} must be an int >= {minimum}, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _parse_entries(
+    raw: object,
+    *,
+    name: str,
+    chunk_count: int,
+    stream_pos: int,
+) -> list[_Entry]:
+    """校验并还原条目列表；来源坐标越界即拒绝。"""
+    if not isinstance(raw, list):
+        raise CheckpointError(
+            f"checkpoint field {name} must be a list, got {type(raw).__name__}"
+        )
+    entries: list[_Entry] = []
+    for i, item in enumerate(raw):
+        where = f"{name}[{i}]"
+        if not isinstance(item, dict):
+            raise CheckpointError(
+                f"checkpoint entry {where} must be a dict, "
+                f"got {type(item).__name__}"
+            )
+        cp = _ck_int(item.get("cp"), f"{where}.cp")
+        if cp > MAX_CODEPOINT:
+            raise CheckpointError(
+                f"checkpoint entry {where}.cp out of range "
+                f"0..0x{MAX_CODEPOINT:X}, got U+{cp:X}"
+            )
+        raw_origins = item.get("origins")
+        if not isinstance(raw_origins, list) or not raw_origins:
+            raise CheckpointError(
+                f"checkpoint entry {where}.origins must be a non-empty list"
+            )
+        origins: list[SourcePoint] = []
+        for j, raw_point in enumerate(raw_origins):
+            pwhere = f"{where}.origins[{j}]"
+            if not isinstance(raw_point, list) or len(raw_point) != 3:
+                raise CheckpointError(
+                    f"checkpoint source point {pwhere} must be "
+                    "[chunk_index, offset, stream_offset]"
+                )
+            chunk_index = _ck_int(raw_point[0], f"{pwhere}[0]")
+            offset = _ck_int(raw_point[1], f"{pwhere}[1]")
+            stream_offset = _ck_int(raw_point[2], f"{pwhere}[2]")
+            if chunk_index >= chunk_count:
+                raise CheckpointError(
+                    f"checkpoint source point {pwhere} references "
+                    f"chunk {chunk_index} but only {chunk_count} chunks "
+                    "were fed"
+                )
+            if stream_offset >= stream_pos:
+                raise CheckpointError(
+                    f"checkpoint source point {pwhere} references stream "
+                    f"offset {stream_offset} but stream position is "
+                    f"{stream_pos}"
+                )
+            origins.append(SourcePoint(chunk_index, offset, stream_offset))
+        entries.append((cp, tuple(origins)))
+    return entries
 
 
 class StreamNormalizer:
@@ -365,6 +482,125 @@ class StreamNormalizer:
         self._result = self._build_result()
         self._finished = True
         return self._result
+
+    # ---- 检查点：导出与恢复 ----------------------------------------------
+
+    def export_checkpoint(self) -> dict:
+        """把当前流状态导出为带版本的 JSON 兼容 dict。
+
+        返回的数据只含 int/str/bool/list/dict，可直接 ``json.dumps`` 后在
+        另一个进程恢复；不使用 pickle，也不含任何对象地址。返回结构是
+        全新构造的——调用方之后修改它不会影响本对象。
+
+        未闭合的规范段**原样保留**在检查点里：导出不会冲刷或闭合它，
+        本对象也可以继续 ``feed``。已 ``finish()`` 的状态同样允许导出，
+        恢复后保持结束语义。
+
+        仅支持 :class:`DictCharacterTable`；其他自定义字符表的处理不受
+        影响，但调用本方法会抛
+        :class:`~canoncompose.errors.CheckpointError`。
+        """
+        if not isinstance(self._table, DictCharacterTable):
+            raise CheckpointError(
+                "checkpoint export requires a DictCharacterTable, got "
+                f"{type(self._table).__name__}"
+            )
+        return {
+            "format": CHECKPOINT_FORMAT,
+            "version": CHECKPOINT_VERSION,
+            "segment_limit": self._limit,
+            "table_fingerprint": _table_fingerprint(self._table),
+            "stream": {
+                "stream_pos": self._stream_pos,
+                "chunk_count": self._chunk_count,
+                "finished": self._finished,
+                "pending_segment": _dump_entries(self._seg),
+                "output": _dump_entries(self._out),
+            },
+        }
+
+    @classmethod
+    def restore_checkpoint(
+        cls,
+        data: object,
+        table: CharacterTable,
+    ) -> StreamNormalizer:
+        """从 :meth:`export_checkpoint` 导出的数据恢复一个流。
+
+        ``data`` 是检查点 dict（可先经 ``json.loads`` 还原）；``table``
+        必须是与导出时**内容相同**的 :class:`DictCharacterTable`——按
+        规范排序的规则表示比对 SHA-256 指纹，内容不同即拒绝。
+
+        格式标签/版本不认识、字段或来源坐标不合法、表类型不支持或指纹
+        不匹配，都抛 :class:`~canoncompose.errors.CheckpointError`；
+        全部校验通过后才构造对象，失败不会留下半恢复对象。
+        """
+        if not isinstance(data, dict):
+            raise CheckpointError(
+                f"checkpoint must be a dict, got {type(data).__name__}"
+            )
+        if data.get("format") != CHECKPOINT_FORMAT:
+            raise CheckpointError(
+                f"unrecognized checkpoint format tag: {data.get('format')!r}"
+            )
+        version = data.get("version")
+        if version != CHECKPOINT_VERSION:
+            raise CheckpointError(
+                f"unsupported checkpoint version: {version!r}"
+            )
+        limit = _ck_int(data.get("segment_limit"), "segment_limit", minimum=1)
+        fingerprint = data.get("table_fingerprint")
+        if not isinstance(fingerprint, str):
+            raise CheckpointError("checkpoint field table_fingerprint must be a str")
+
+        stream = data.get("stream")
+        if not isinstance(stream, dict):
+            raise CheckpointError("checkpoint field stream must be a dict")
+        stream_pos = _ck_int(stream.get("stream_pos"), "stream.stream_pos")
+        chunk_count = _ck_int(stream.get("chunk_count"), "stream.chunk_count")
+        finished = stream.get("finished")
+        if not isinstance(finished, bool):
+            raise CheckpointError("checkpoint field stream.finished must be a bool")
+        pending = _parse_entries(
+            stream.get("pending_segment"),
+            name="stream.pending_segment",
+            chunk_count=chunk_count,
+            stream_pos=stream_pos,
+        )
+        output = _parse_entries(
+            stream.get("output"),
+            name="stream.output",
+            chunk_count=chunk_count,
+            stream_pos=stream_pos,
+        )
+        if finished and pending:
+            raise CheckpointError(
+                "finished checkpoint must not carry a pending segment"
+            )
+
+        if not isinstance(table, DictCharacterTable):
+            raise CheckpointError(
+                "checkpoint restore requires a DictCharacterTable, got "
+                f"{type(table).__name__}"
+            )
+        actual = _table_fingerprint(table)
+        if actual != fingerprint:
+            raise CheckpointError(
+                "character table mismatch: checkpoint was exported with a "
+                "different table (fingerprint "
+                f"{fingerprint}, got {actual})"
+            )
+
+        # 全部校验通过，此处才开始构造，不会留下半恢复对象。
+        restored = cls(table, segment_limit=limit)
+        restored._seg = pending
+        restored._out = output
+        restored._stream_pos = stream_pos
+        restored._chunk_count = chunk_count
+        if finished:
+            restored._result = restored._build_result()
+            restored._finished = True
+        return restored
 
     def _build_result(self) -> NormalizationResult:
         codepoints = tuple(cp for cp, _ in self._out)

@@ -4,11 +4,14 @@
 
     normalize(chunks, table, *, segment_limit=1024) -> NormalizationResult
     StreamNormalizer(table, *, segment_limit=1024)  # feed/finish 流式 API
+    StreamNormalizer.export_checkpoint()            # 导出 JSON 兼容检查点
+    StreamNormalizer.restore_checkpoint(data, table)  # 从检查点恢复
     DictCharacterTable(...)                          # 字典字符表
     CharacterTable                                   # 字符表协议基类
     NormalizationResult / SourcePoint / SourceSpan   # 结果数据结构
     CanonicalError / InvalidInputError / InvalidTableError /
-        DecompositionCycleError / SegmentLimitError  # 错误类型
+        DecompositionCycleError / SegmentLimitError /
+        CheckpointError                              # 错误类型
 
 本库不读取、不引用任何系统 Unicode 数据库；规范化所需的分解、ccc 与
 二元组合映射全部由调用方显式提供。
@@ -26,6 +29,7 @@ from .engine import (
 )
 from .errors import (
     CanonicalError,
+    CheckpointError,
     DecompositionCycleError,
     InvalidInputError,
     InvalidTableError,
@@ -49,6 +53,7 @@ __all__ = [
     "InvalidTableError",
     "DecompositionCycleError",
     "SegmentLimitError",
+    "CheckpointError",
 ]
 
 __version__ = "1.0.0"
