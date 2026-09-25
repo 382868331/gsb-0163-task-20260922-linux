@@ -4,9 +4,11 @@
 
     normalize(chunks, table, *, segment_limit=1024) -> NormalizationResult
     StreamNormalizer(table, *, segment_limit=1024)  # feed/finish 流式 API
+        # 另提供 query_output_ranges / pending_sources 输入选区反查
     DictCharacterTable(...)                          # 字典字符表
     CharacterTable                                   # 字符表协议基类
     NormalizationResult / SourcePoint / SourceSpan   # 结果数据结构
+    OutputRange / SourceQueryResult                  # 反查结果数据结构
     CanonicalError / InvalidInputError / InvalidTableError /
         DecompositionCycleError / SegmentLimitError  # 错误类型
 
@@ -19,7 +21,9 @@ from __future__ import annotations
 from .engine import (
     DEFAULT_SEGMENT_LIMIT,
     NormalizationResult,
+    OutputRange,
     SourcePoint,
+    SourceQueryResult,
     SourceSpan,
     StreamNormalizer,
     normalize,
@@ -37,7 +41,9 @@ from .validators import validate_codepoint
 __all__ = [
     "DEFAULT_SEGMENT_LIMIT",
     "NormalizationResult",
+    "OutputRange",
     "SourcePoint",
+    "SourceQueryResult",
     "SourceSpan",
     "StreamNormalizer",
     "normalize",

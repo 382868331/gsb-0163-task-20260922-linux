@@ -10,8 +10,9 @@
 2. 把同一输入按固定切点分成 3 个 chunk 流式 feed，验证分块结果与一次性
    结果一致；
 3. 对规范串再规范化一次，验证幂等；
-4. 打印输出来源区间集合；
-5. 边界演示（真实触发、非预录）：循环分解表触发 DecompositionCycleError；
+4. 反向来源索引：输入选区反查已发布输出区间（含 pending 与失败示例）；
+5. 打印输出来源区间集合；
+6. 边界演示（真实触发、非预录）：循环分解表触发 DecompositionCycleError；
    单段 1025 码点触发 SegmentLimitError。
 
 所有结果都是现场计算，不使用 sleep 或预录结果。
@@ -23,6 +24,7 @@ import time
 
 from canoncompose import (
     DecompositionCycleError,
+    InvalidInputError,
     SegmentLimitError,
     StreamNormalizer,
     normalize,
@@ -47,6 +49,13 @@ def _format_spans(spans) -> str:
     return ", ".join(
         f"chunk {s.chunk_index}[{s.start}:{s.end}]" for s in spans
     ) or "(空)"
+
+
+def _format_ranges(ranges) -> str:
+    return ", ".join(
+        f"输出[{r.start}:{r.end}]{' 混入选区外来源' if r.mixed else ''}"
+        for r in ranges
+    ) or "(无交集)"
 
 
 def main() -> None:
@@ -95,7 +104,37 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("4. 拒绝边界 A：循环分解表（真实触发）")
+    print("4. 反向来源索引：输入选区反查已发布输出区间")
+    print("-" * 68)
+    rev = StreamNormalizer(table)
+    rev.feed(chr(A))               # chunk 0：'a'，段挂起
+    rev.feed(chr(M_GRAVE))         # chunk 1：grave，与 chunk 0 跨块同段
+    q = rev.query_output_ranges(0, 0, 1)
+    print("feed 'a'、grave 后（未 finish）查询 chunk 0[0:1]:")
+    print("  命中输出:", _format_ranges(q.ranges))
+    print("  pending :", _format_spans(q.pending), "（段缓冲中，未发布）")
+    rev.feed(chr(E))               # chunk 2：starter 冲刷前一段（a+grave→à）
+    q = rev.query_output_ranges(1, 0, 1)
+    print("再 feed 'e' 后查询 chunk 1[0:1]（grave 一侧）:")
+    print("  命中输出:", _format_ranges(q.ranges))
+    print("  pending :", _format_spans(q.pending))
+    rev.finish()
+    q = rev.query_output_ranges(0, 0, 1)
+    print("finish 后查询 chunk 0[0:1]（'a' 一侧）:")
+    print("  命中输出:", _format_ranges(q.ranges))
+    print("  pending :", _format_spans(q.pending))
+    q = rev.query_output_ranges(0, 0, 0)
+    print("空区间 chunk 0[0:0]（只做合法性检查）:",
+          _format_ranges(q.ranges), "/", _format_spans(q.pending))
+    try:
+        rev.query_output_ranges(0, 2, 1)
+    except InvalidInputError as exc:
+        print(f"失败示例（真实触发）查询 chunk 0[2:1] → "
+              f"{type(exc).__name__}: {exc}")
+
+    print()
+    print("=" * 68)
+    print("5. 拒绝边界 A：循环分解表（真实触发）")
     print("-" * 68)
     try:
         normalize([chr(0xE200)], build_cyclic_table())
@@ -106,7 +145,7 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("5. 拒绝边界 B：单段超过 1024 码点上限（真实触发）")
+    print("6. 拒绝边界 B：单段超过 1024 码点上限（真实触发）")
     print("-" * 68)
     # 一个 starter + 1024 个非 starter，分解后单段为 1025 个码点。
     big = 0xE400

@@ -62,6 +62,33 @@ def validate_codepoint(
     return cp
 
 
+def validate_non_negative_int(
+    value: object,
+    name: str,
+    *,
+    chunk_index: int | None = None,
+) -> int:
+    """校验查询边界类参数为非负 int（拒绝 bool 与 NaN/Infinity）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, float):
+            if math.isnan(value):
+                raise InvalidInputError(f"{name} is NaN", chunk_index=chunk_index)
+            if math.isinf(value):
+                raise InvalidInputError(
+                    f"{name} is Infinity", chunk_index=chunk_index
+                )
+        raise InvalidInputError(
+            f"{name} must be int, got {type(value).__name__}",
+            chunk_index=chunk_index,
+        )
+    if value < 0:
+        raise InvalidInputError(
+            f"{name} must be non-negative, got {value}",
+            chunk_index=chunk_index,
+        )
+    return value
+
+
 def validate_chunk(chunk: object, chunk_index: int) -> str:
     """校验一个输入 chunk 必须是 str。"""
     if not isinstance(chunk, str):

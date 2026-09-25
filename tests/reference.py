@@ -40,11 +40,8 @@ def _naive_compose(segment, table, ccc_of):
     return [base, *pending]
 
 
-def reference_normalize(chunks, table):
-    """一次性返回 (码点元组, 来源点元组)。
-
-    来源点为 ``(chunk_index, offset, stream_offset)``。
-    """
+def _reference_run(chunks, table):
+    """朴素分解-排序-组合，返回 (码点元组, 逐输出来源点集合元组)。"""
     # 1) 全量递归分解，逐叶子记录来源。
     leaves = []  # (cp, (chunk_index, offset, stream_offset))
     stream_pos = 0
@@ -121,6 +118,15 @@ def reference_normalize(chunks, table):
         for i in keep:
             out_cps.append(cps[i])
             out_points.append(frozenset(bag[i]))
+    return tuple(out_cps), tuple(out_points)
+
+
+def reference_normalize(chunks, table):
+    """一次性返回 (码点元组, 来源区间元组)。
+
+    来源区间为 ``(chunk_index, start, end)`` 半开区间，同 chunk 连续点已合并。
+    """
+    out_cps, out_points = _reference_run(chunks, table)
 
     # 展平来源点并合并同 chunk 连续偏移（独立复算区间集合）。
     all_points = set()
@@ -132,4 +138,14 @@ def reference_normalize(chunks, table):
             spans[-1] = (ci, spans[-1][1], off + 1)
         else:
             spans.append((ci, off, off + 1))
-    return tuple(out_cps), tuple(spans)
+    return out_cps, tuple(spans)
+
+
+def reference_output_sources(chunks, table):
+    """独立复算每个输出码点的来源点集合（逐输出扫描参照）。
+
+    返回 ``tuple[frozenset[(chunk_index, offset, stream_offset)], ...]``，
+    与 reference_normalize 的码点序列一一对应。用于反查测试：对每个
+    输入选区逐输出扫描这些集合，独立算出期望的相交输出区间。
+    """
+    return _reference_run(chunks, table)[1]

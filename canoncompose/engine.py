@@ -19,8 +19,15 @@
 抛 :class:`~canoncompose.errors.SegmentLimitError`。
 
 ``feed()`` 是原子的：任一码点处理失败时，本次 feed 已造成的流状态变更
-全部回滚（段缓冲、已输出缓冲、流偏移、chunk 计数），不留下未说明的
-部分变更。
+全部回滚（段缓冲、已输出缓冲、流偏移、chunk 计数、反向索引），不留下
+未说明的部分变更。
+
+反向来源索引：流在发布输出的同时增量维护"输入点 → 输出位置"的反向
+索引，:meth:`StreamNormalizer.query_output_ranges` 据此把输入半开区间
+映射回所有与之有交集的输出区间。递归分解可让一个输入字符产生多个
+输出、组合又会合并不同来源，索引不假设一对一或整体单调；查询只覆盖
+**已发布**输出，仍在规范段缓冲中的输入来源以 ``pending`` 区间单独返回，
+查询不会触发 ``finish``。
 """
 
 from __future__ import annotations
@@ -35,11 +42,18 @@ from .errors import (
     SegmentLimitError,
 )
 from .table import CharacterTable
-from .validators import MAX_CODEPOINT, validate_chunk, validate_positive_int
+from .validators import (
+    MAX_CODEPOINT,
+    validate_chunk,
+    validate_non_negative_int,
+    validate_positive_int,
+)
 
 __all__ = [
     "SourcePoint",
     "SourceSpan",
+    "OutputRange",
+    "SourceQueryResult",
     "NormalizationResult",
     "StreamNormalizer",
     "normalize",
@@ -68,6 +82,34 @@ class SourceSpan:
 
 
 @dataclass(frozen=True)
+class OutputRange:
+    """反查结果中的一段已发布输出：半开区间 ``[start, end)``（输出码点位置）。
+
+    - ``mixed``：``True`` 表示该段输出的来源除选区内的输入外，还混入了
+      选区之外的输入码点（例如跨 chunk 组合的另一端不在选区内）。
+    """
+
+    start: int
+    end: int
+    mixed: bool
+
+
+@dataclass(frozen=True)
+class SourceQueryResult:
+    """输入选区反查结果（见 :meth:`StreamNormalizer.query_output_ranges`）。
+
+    - ``ranges``：与选区有交集的已发布输出区间，按输出位置有序，
+      相邻且 ``mixed`` 相同的段已合并；
+    - ``pending``：查询时仍滞留在规范段缓冲中的输入来源区间
+      （半开区间，按 chunk、偏移有序，连续点已合并）。这些输入尚未产生
+      已发布输出，不参与 ``ranges`` 的交集判定。
+    """
+
+    ranges: tuple[OutputRange, ...]
+    pending: tuple[SourceSpan, ...]
+
+
+@dataclass(frozen=True)
 class NormalizationResult:
     """规范化结果。
 
@@ -90,6 +132,23 @@ _Entry = tuple[int, tuple[SourcePoint, ...]]
 
 # 迭代 DFS 的栈帧：[码点, 一步子节点(None=未查询), 下一子节点下标, 累加叶子]
 _Frame = list
+
+
+def _merge_points_to_spans(points: set[SourcePoint]) -> tuple[SourceSpan, ...]:
+    """把来源点集合合并为有序的同 chunk 连续半开区间。"""
+    ordered = sorted(points, key=lambda p: (p.chunk_index, p.offset))
+    spans: list[SourceSpan] = []
+    for p in ordered:
+        if (
+            spans
+            and spans[-1].chunk_index == p.chunk_index
+            and spans[-1].end == p.offset
+        ):
+            prev = spans[-1]
+            spans[-1] = SourceSpan(prev.chunk_index, prev.start, p.offset + 1)
+        else:
+            spans.append(SourceSpan(p.chunk_index, p.offset, p.offset + 1))
+    return tuple(spans)
 
 
 def _validate_table_codepoint(value: object, *, owner: int) -> int:
@@ -146,6 +205,11 @@ class StreamNormalizer:
 
         self._seg: list[_Entry] = []
         self._out: list[_Entry] = []
+        # 反向索引：(chunk_index, offset) -> 已发布输出位置列表（升序）。
+        # 只覆盖 _out 中已发布的条目；段缓冲中的条目不进入索引。
+        self._reverse: dict[tuple[int, int], list[int]] = {}
+        # 已成功 feed 的各 chunk 长度（码点数），用于选区合法性校验。
+        self._chunk_lengths: list[int] = []
         self._stream_pos = 0
         self._chunk_count = 0
         self._finished = False
@@ -322,6 +386,34 @@ class StreamNormalizer:
                 pending.append(entry)
         return [base, *pending]
 
+    # ---- 输出发布与反向索引 ----------------------------------------------
+
+    def _publish(self, entries: list[_Entry]) -> None:
+        """把段闭合冲刷出的条目追加到已发布输出，并同步反向索引。"""
+        pos = len(self._out)
+        self._out.extend(entries)
+        for i, (_, origins) in enumerate(entries):
+            out_pos = pos + i
+            for point in origins:
+                key = (point.chunk_index, point.offset)
+                bucket = self._reverse.get(key)
+                if bucket is None:
+                    self._reverse[key] = [out_pos]
+                else:
+                    bucket.append(out_pos)
+
+    def _rebuild_reverse(self) -> None:
+        """从已发布输出整体重建反向索引（仅用于 feed 失败回滚）。"""
+        self._reverse = {}
+        for pos, (_, origins) in enumerate(self._out):
+            for point in origins:
+                key = (point.chunk_index, point.offset)
+                bucket = self._reverse.get(key)
+                if bucket is None:
+                    self._reverse[key] = [pos]
+                else:
+                    bucket.append(pos)
+
     # ---- 公开 API -----------------------------------------------------
 
     def feed(self, chunk: str) -> None:
@@ -330,7 +422,8 @@ class StreamNormalizer:
             raise InvalidInputError("stream already finished")
         validate_chunk(chunk, self._chunk_count)
 
-        # 快照全部可变流状态（展开/ccc 缓存只存已验证结果，属纯增益）。
+        # 快照全部可变流状态（展开/ccc 缓存只存已验证结果，属纯增益；
+        # 反向索引由 _out 派生，回滚 _out 后整体重建）。
         backup_seg = list(self._seg)
         backup_out_len = len(self._out)
         backup_pos = self._stream_pos
@@ -346,10 +439,12 @@ class StreamNormalizer:
                 for leaf in self._expand(ord(ch)):
                     flushed = self._append_leaf(leaf, origins, point)
                     if flushed:
-                        self._out.extend(flushed)
+                        self._publish(flushed)
+            self._chunk_lengths.append(len(chunk))
         except Exception:
             self._seg = backup_seg
             del self._out[backup_out_len:]
+            self._rebuild_reverse()
             self._stream_pos = backup_pos
             self._chunk_count = backup_chunk_count
             raise
@@ -360,7 +455,7 @@ class StreamNormalizer:
             assert self._result is not None
             return self._result
         if self._seg:
-            self._out.extend(self._compose_segment(self._seg))
+            self._publish(self._compose_segment(self._seg))
             self._seg = []
         self._result = self._build_result()
         self._finished = True
@@ -373,20 +468,86 @@ class StreamNormalizer:
         points: set[SourcePoint] = set()
         for _, origins in self._out:
             points.update(origins)
-        ordered = sorted(points, key=lambda p: (p.chunk_index, p.offset))
+        spans = _merge_points_to_spans(points)
+        return NormalizationResult(text, codepoints, spans)
 
-        spans: list[SourceSpan] = []
-        for p in ordered:
-            if (
-                spans
-                and spans[-1].chunk_index == p.chunk_index
-                and spans[-1].end == p.offset
-            ):
-                prev = spans[-1]
-                spans[-1] = SourceSpan(prev.chunk_index, prev.start, p.offset + 1)
+    # ---- 反向查询 -------------------------------------------------------
+
+    def query_output_ranges(
+        self,
+        chunk_index: int,
+        start: int,
+        end: int,
+    ) -> SourceQueryResult:
+        """把输入半开区间 ``chunk[chunk_index][start:end]`` 反查为输出区间。
+
+        返回与选区有交集的全部**已发布**输出区间（按输出位置合并连续且
+        ``mixed`` 相同的段）；``mixed=True`` 表示该段输出的来源还混入选区
+        之外的输入。仍在规范段缓冲中的输入来源以 ``pending`` 单独返回；
+        查询不触发 ``finish()``，之后仍可继续 ``feed``。
+
+        空区间（``start == end``）只做合法性检查，返回空结果。
+        坐标合法性（类型、非负、``start <= end``、chunk 已 feed、
+        ``end`` 不超过该 chunk 长度）不满足时抛
+        :class:`~canoncompose.errors.InvalidInputError`。
+        """
+        self._validate_query_range(chunk_index, start, end)
+        if start == end:
+            return SourceQueryResult((), ())
+
+        positions: set[int] = set()
+        for offset in range(start, end):
+            bucket = self._reverse.get((chunk_index, offset))
+            if bucket:
+                positions.update(bucket)
+
+        ranges: list[OutputRange] = []
+        for pos in sorted(positions):
+            _, origins = self._out[pos]
+            mixed = any(
+                not (p.chunk_index == chunk_index and start <= p.offset < end)
+                for p in origins
+            )
+            if ranges and ranges[-1].mixed == mixed and ranges[-1].end == pos:
+                prev = ranges[-1]
+                ranges[-1] = OutputRange(prev.start, pos + 1, mixed)
             else:
-                spans.append(SourceSpan(p.chunk_index, p.offset, p.offset + 1))
-        return NormalizationResult(text, codepoints, tuple(spans))
+                ranges.append(OutputRange(pos, pos + 1, mixed))
+        return SourceQueryResult(tuple(ranges), self.pending_sources())
+
+    def pending_sources(self) -> tuple[SourceSpan, ...]:
+        """当前仍滞留在规范段缓冲中的输入来源区间（不触发 ``finish``）。"""
+        points: set[SourcePoint] = set()
+        for _, origins in self._seg:
+            points.update(origins)
+        return _merge_points_to_spans(points)
+
+    def _validate_query_range(
+        self, chunk_index: object, start: object, end: object
+    ) -> None:
+        chunk_index = validate_non_negative_int(chunk_index, "chunk_index")
+        start = validate_non_negative_int(
+            start, "start", chunk_index=chunk_index
+        )
+        end = validate_non_negative_int(end, "end", chunk_index=chunk_index)
+        if chunk_index >= len(self._chunk_lengths):
+            raise InvalidInputError(
+                f"chunk {chunk_index} has not been fed "
+                f"({len(self._chunk_lengths)} chunk(s) so far)",
+                chunk_index=chunk_index,
+            )
+        if start > end:
+            raise InvalidInputError(
+                f"query range start {start} > end {end}",
+                chunk_index=chunk_index,
+            )
+        length = self._chunk_lengths[chunk_index]
+        if end > length:
+            raise InvalidInputError(
+                f"query end {end} exceeds chunk {chunk_index} "
+                f"length {length}",
+                chunk_index=chunk_index,
+            )
 
 
 def normalize(

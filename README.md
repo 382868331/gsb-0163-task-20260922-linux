@@ -17,24 +17,26 @@ NFC/NFD 等行业标准完整兼容**。
 ## 准确命令
 
 ```bash
-# 必要测试（44 个）
-python -m unittest discover -s tests -v
+# 必要测试（67 个）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示（现场计算，约 2 ms，远小于 8 秒预算；无 sleep、无预录）
-python demo.py
+# 固定输入演示（现场计算，约 2 ms，远小于 90 秒预算；无 sleep、无预录）
+./.venv/bin/python demo.py
 ```
 
-两条命令均在仓库根目录执行。
+两条命令均在仓库根目录执行；解释器为仓库内 `./.venv/bin/python`
+（Python 3.14.7），仅使用标准库。
 
 ## 公开接口
 
 ```python
 from canoncompose import (
     normalize,            # 一次性 API
-    StreamNormalizer,     # 流式 API：feed / finish
+    StreamNormalizer,     # 流式 API：feed / finish / query_output_ranges
     DictCharacterTable,   # 字典字符表
     CharacterTable,       # 字符表协议抽象基类（也可直接鸭子类型）
     NormalizationResult, SourcePoint, SourceSpan,
+    OutputRange, SourceQueryResult,
     CanonicalError, InvalidInputError, InvalidTableError,
     DecompositionCycleError, SegmentLimitError,
 )
@@ -79,6 +81,48 @@ result = sn.finish()   # 冲刷最后一段；重复调用返回同一结果
 
 starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因此未闭合
 的"规范段"保留在流内部，直到遇到下一个 starter 或 `finish()` 才输出。
+
+### 反向来源索引（输入选区反查输出）
+
+编辑器场景：已知输入中的一个选区，反查它影响到了哪些输出字符。
+
+```python
+sn = StreamNormalizer(table)
+sn.feed("a")            # chunk 0
+sn.feed(chr(0xE020))    # chunk 1：grave 记号，与 chunk 0 的 'a' 跨块组合
+sn.feed("e")            # chunk 2：starter 冲刷前一段
+
+q = sn.query_output_ranges(1, 0, 1)   # 选中 chunk 1 的半开区间 [0, 1)
+# q.ranges == (OutputRange(start=0, end=1, mixed=True),)
+#   输出 [0,1) 是组合字符 à，其来源还混入选区外的 chunk 0 'a' → mixed=True
+# q.pending == (SourceSpan(2, 0, 1),)
+#   chunk 2 的 'e' 仍在规范段缓冲中，尚未发布，单独列为 pending
+```
+
+契约要点：
+
+- **只查已发布输出**：`ranges` 只覆盖段已闭合、已冲刷到输出缓冲的码点；
+  仍在规范段缓冲中的输入来源以 `pending`（`SourceSpan` 元组）单独返回。
+  **查询不会触发 `finish()`**，之后可以继续 `feed`。
+- **交集语义**：输出码点的来源点集合与选区有交集即命中；`mixed=True`
+  表示该段输出的来源还混入选区之外的输入（递归分解可让一个输入字符
+  产生多个输出、组合又会合并不同来源，索引不假设一对一或整体单调）。
+- **区间合并**：`ranges` 按输出位置有序，相邻且 `mixed` 相同的连续段
+  已合并；`mixed` 不同的相邻段不合并。
+- **空区间**：`start == end` 只做合法性检查，返回空结果
+  （`ranges` 与 `pending` 均为空）。
+- **坐标**：查询用 `(chunk_index, start, end)` 半开区间，`start`/`end`
+  是该 chunk 内的码点偏移；合法性要求 `0 <= start <= end <= 该 chunk
+  长度` 且 chunk 已 `feed` 过，否则抛 `InvalidInputError`（拒绝
+  bool/NaN/Infinity/负数/反向区间）。
+- `pending_sources()` 可单独查询当前段缓冲中的输入来源区间。
+
+可复现的完整路径见 `demo.py` 第 4 节（含未 finish 时的 pending、
+跨块组合两侧的 `mixed` 命中，以及 `query_output_ranges(0, 2, 1)`
+反向区间触发 `InvalidInputError` 的失败示例）。
+
+正向索引（`NormalizationResult.source_spans`，输出 → 输入来源区间集合）
+保持不变，两者互为正反方向。
 
 ## 算法与阻塞规则（契约）
 
@@ -145,6 +189,10 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
   固有特征。
 - 来源区间按"输出码点 → 输入来源点并集 → 同 chunk 连续点合并"计算，
   语义直观；不尝试输出字符级的多层 provenance 树。
+- 反向索引随输出发布增量维护（输入点 → 输出位置），`feed` 原子回滚时
+  由截断后的输出缓冲整体重建（回滚是罕见路径）；段缓冲中的条目不进
+  索引，因此查询天然只覆盖已发布输出，无需为查询强制 `finish`。
+  本功能只做"输入选区 → 输出区间"的反查，不是检查点/文本编辑重算。
 - 表查询结果（分解叶子、ccc）在单次运行内缓存：既加速重复码点，也
   保证运行内表视图一致；表在运行中途被外部修改属于未定义用法。
 
@@ -169,10 +217,14 @@ canoncompose/          # 本题库
   errors.py            # 错误类型与定位字段
   validators.py        # 数值/码点校验
 tests/
-  test_normalize.py    # 必要测试（44 个）
-  reference.py         # 独立一次性朴素参考实现（不导入被测核心）
-demo.py                # 固定输入演示
+  test_normalize.py      # 必要测试（44 个）
+  test_reverse_index.py  # 反向来源索引测试（23 个）
+  reference.py           # 独立一次性朴素参考实现（不导入被测核心）
+demo.py                  # 固定输入演示
 ```
 
 测试中的期望值来自 `tests/reference.py` 里独立编写的朴素分解-排序-组合
-实现（**不调用被测核心**）；与被测结果的往返一致只作为补充断言。
+实现（**不调用被测核心**）；与被测结果的往返一致只作为补充断言。反向
+索引的随机测试以该参考的**逐输出来源点集合**为参照：对每个随机输入
+选区逐输出扫描来源集、独立算出期望的命中区间与 `mixed` 标记，再与
+`query_output_ranges` 的结果比对。
