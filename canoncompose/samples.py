@@ -30,6 +30,7 @@ __all__ = [
     "CYCLE_X",
     "CYCLE_Y",
     "build_demo_table",
+    "build_demo_table_plus",
     "build_cyclic_table",
     "describe",
 ]
@@ -56,29 +57,49 @@ CYCLE_X = 0xE200
 CYCLE_Y = 0xE201
 
 
+_DEMO_DECOMPOSITIONS = {
+    P_A_GRAVE: (A, M_GRAVE),
+    P_E_ACUTE: (E, M_ACUTE),
+    P_O_ACUTE: (O, M_ACUTE),
+    # 多级分解：P_A_GRAVE_RING → P_A_GRAVE → (a, grave)
+    P_A_GRAVE_RING: (P_A_GRAVE, M_RING),
+}
+
+_DEMO_COMBINING_CLASSES = {
+    M_GRAVE: 230,
+    M_ACUTE: 230,
+    M_DOTBELOW: 220,
+    M_RING: 232,
+}
+
+_DEMO_COMPOSITIONS = {
+    (A, M_GRAVE): P_A_GRAVE,
+    (E, M_ACUTE): P_E_ACUTE,
+    (O, M_ACUTE): P_O_ACUTE,
+    # 基字符先被换成 agrave 后继续与 ring(232) 组合
+    (P_A_GRAVE, M_RING): P_A_GRAVE_RING,
+}
+
+
 def build_demo_table() -> DictCharacterTable:
     """返回演示/测试用的确定性字符表。"""
     return DictCharacterTable(
-        decompositions={
-            P_A_GRAVE: (A, M_GRAVE),
-            P_E_ACUTE: (E, M_ACUTE),
-            P_O_ACUTE: (O, M_ACUTE),
-            # 多级分解：P_A_GRAVE_RING → P_A_GRAVE → (a, grave)
-            P_A_GRAVE_RING: (P_A_GRAVE, M_RING),
-        },
-        combining_classes={
-            M_GRAVE: 230,
-            M_ACUTE: 230,
-            M_DOTBELOW: 220,
-            M_RING: 232,
-        },
-        compositions={
-            (A, M_GRAVE): P_A_GRAVE,
-            (E, M_ACUTE): P_E_ACUTE,
-            (O, M_ACUTE): P_O_ACUTE,
-            # 基字符先被换成 agrave 后继续与 ring(232) 组合
-            (P_A_GRAVE, M_RING): P_A_GRAVE_RING,
-        },
+        decompositions=_DEMO_DECOMPOSITIONS,
+        combining_classes=_DEMO_COMBINING_CLASSES,
+        compositions=_DEMO_COMPOSITIONS,
+    )
+
+
+def build_demo_table_plus() -> DictCharacterTable:
+    """演示表多加一条组合规则（a + ring → 两级预组合）。
+
+    与 :func:`build_demo_table` 内容不同，因此指纹不同；用于演示/测试
+    检查点恢复时的"表不匹配"拒绝路径。
+    """
+    return DictCharacterTable(
+        decompositions=_DEMO_DECOMPOSITIONS,
+        combining_classes=_DEMO_COMBINING_CLASSES,
+        compositions={**_DEMO_COMPOSITIONS, (A, M_RING): P_A_GRAVE_RING},
     )
 
 

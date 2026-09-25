@@ -22,10 +22,31 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from abc import ABC, abstractmethod
 from typing import Mapping
 
+from .errors import InvalidTableError
+from .validators import MAX_CODEPOINT
+
 __all__ = ["CharacterTable", "DictCharacterTable"]
+
+# 指纹/规则规范化使用的固定名字，写入哈希载荷，避免不同规则类别互相顶替。
+_FP_SPEC_VERSION = 1
+
+
+def _validate_rule_codepoint(value: object, *, what: str) -> int:
+    """校验规则表里的码点（键、分解子节点、组合结果），非法抛 InvalidTableError。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidTableError(
+            f"{what} must be int, got {type(value).__name__}"
+        )
+    if value < 0 or value > MAX_CODEPOINT:
+        raise InvalidTableError(
+            f"{what} out of range 0..0x{MAX_CODEPOINT:X}, got {value!r}"
+        )
+    return value
 
 
 class CharacterTable(ABC):
@@ -70,3 +91,85 @@ class DictCharacterTable(CharacterTable):
 
     def composition(self, left: int, right: int) -> int | None:
         return self._comp.get((left, right))
+
+    # ---- 规则快照与内容指纹（供检查点恢复时核对表身份） ------------------
+
+    def canonical_rules(self) -> dict:
+        """把有限规则整理成**规范排序**的 JSON 兼容结构。
+
+        - 分解：``[[码点, [子码点, ...]], ...]`` 按码点升序；
+        - ccc：``[[码点, ccc], ...]`` 按码点升序（显式写出的 ``ccc=0``
+          条目保留，与缺省语义相同但内容不同，指纹也不同）；
+        - 组合：``[[左, 右, 结果], ...]`` 按 ``(左, 右)`` 升序。
+
+        排序使指纹只取决于规则内容，与构造时的插入顺序无关。规则内容
+        非法（码点越界、分解为空元组、ccc 为负或 bool 等）时抛
+        :class:`~canoncompose.errors.InvalidTableError`。
+        """
+        decomp: list[list] = []
+        for cp, children in self._decomp.items():
+            _validate_rule_codepoint(cp, what="decomposition key")
+            if not isinstance(children, tuple) or len(children) == 0:
+                raise InvalidTableError(
+                    "decomposition rules must be non-empty tuples, got "
+                    f"{children!r} for key U+{cp:04X}"
+                )
+            decomp.append(
+                [
+                    cp,
+                    [
+                        _validate_rule_codepoint(c, what="decomposition child")
+                        for c in children
+                    ],
+                ]
+            )
+        decomp.sort(key=lambda entry: entry[0])
+
+        ccc: list[list[int]] = []
+        for cp, value in self._ccc.items():
+            _validate_rule_codepoint(cp, what="combining class key")
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise InvalidTableError(
+                    "combining class must be int, got "
+                    f"{type(value).__name__} for key U+{cp:04X}"
+                )
+            if value < 0:
+                raise InvalidTableError(
+                    f"combining class must be non-negative, got {value} "
+                    f"for key U+{cp:04X}"
+                )
+            ccc.append([cp, value])
+        ccc.sort(key=lambda entry: entry[0])
+
+        comp: list[list[int]] = []
+        for key, result in self._comp.items():
+            if not isinstance(key, tuple) or len(key) != 2:
+                raise InvalidTableError(
+                    f"composition key must be a (left, right) tuple, got {key!r}"
+                )
+            left = _validate_rule_codepoint(key[0], what="composition left")
+            right = _validate_rule_codepoint(key[1], what="composition right")
+            comp.append(
+                [left, right, _validate_rule_codepoint(result, what="composition result")]
+            )
+        comp.sort(key=lambda entry: (entry[0], entry[1]))
+
+        return {
+            "decompositions": decomp,
+            "combining_classes": ccc,
+            "compositions": comp,
+        }
+
+    def fingerprint(self) -> str:
+        """表内容指纹：规范排序规则的 JSON 的 SHA-256 十六进制串。
+
+        只依赖规则内容，不依赖对象地址、进程或插入顺序；同内容的表在
+        另一个进程重建后指纹相同。规则内容非法时抛
+        :class:`~canoncompose.errors.InvalidTableError`。
+        """
+        payload = {
+            "fingerprint_spec": _FP_SPEC_VERSION,
+            "rules": self.canonical_rules(),
+        }
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()

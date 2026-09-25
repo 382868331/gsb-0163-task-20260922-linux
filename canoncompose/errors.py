@@ -13,6 +13,7 @@ __all__ = [
     "InvalidTableError",
     "DecompositionCycleError",
     "SegmentLimitError",
+    "CheckpointError",
 ]
 
 
@@ -135,3 +136,16 @@ class SegmentLimitError(CanonicalError):
         self.offset = offset
         self.stream_offset = stream_offset
         self.codepoint = codepoint
+
+
+class CheckpointError(CanonicalError, ValueError):
+    """检查点导出/恢复失败。
+
+    触发情形包括：在非 :class:`~canoncompose.table.DictCharacterTable`
+    （精确类型，含覆盖其方法的子类）上尝试导出；检查点数据不是版本化
+    JSON 兼容结构、格式版本不认识、必含字段缺失或类型/范围非法、来源
+    坐标不合法、``segment_limit`` 不一致，或恢复时传入的表指纹与检查点
+    记录不一致。
+
+    恢复失败是全有或全无的：抛出本异常时不会产生半恢复对象。
+    """
