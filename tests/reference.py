@@ -40,10 +40,11 @@ def _naive_compose(segment, table, ccc_of):
     return [base, *pending]
 
 
-def reference_normalize(chunks, table):
-    """一次性返回 (码点元组, 来源点元组)。
+def reference_normalize_detailed(chunks, table):
+    """一次性返回 (码点元组, 每个输出码点的来源点集合元组)。
 
-    来源点为 ``(chunk_index, offset, stream_offset)``。
+    来源点为 ``(chunk_index, offset, stream_offset)``；每个输出码点对应
+    一个 frozenset（组合时取并集）。供查找测试做朴素逐码点匹配参考。
     """
     # 1) 全量递归分解，逐叶子记录来源。
     leaves = []  # (cp, (chunk_index, offset, stream_offset))
@@ -122,6 +123,15 @@ def reference_normalize(chunks, table):
             out_cps.append(cps[i])
             out_points.append(frozenset(bag[i]))
 
+    return tuple(out_cps), tuple(out_points)
+
+
+def reference_normalize(chunks, table):
+    """一次性返回 (码点元组, 来源区间元组)。
+
+    来源点为 ``(chunk_index, offset, stream_offset)``。
+    """
+    out_cps, out_points = reference_normalize_detailed(chunks, table)
     # 展平来源点并合并同 chunk 连续偏移（独立复算区间集合）。
     all_points = set()
     for bag_i in out_points:

@@ -43,6 +43,7 @@ __all__ = [
     "NormalizationResult",
     "StreamNormalizer",
     "normalize",
+    "merge_source_spans",
     "DEFAULT_SEGMENT_LIMIT",
 ]
 
@@ -87,6 +88,27 @@ class NormalizationResult:
 
 # 内部条目：(码点, 来源点元组)，不可变，便于原子回滚。
 _Entry = tuple[int, tuple[SourcePoint, ...]]
+
+
+def merge_source_spans(points: Iterable[SourcePoint]) -> tuple[SourceSpan, ...]:
+    """把来源点集合合并为有序区间集合（同 chunk 内连续点合并）。
+
+    与 finish() 输出的 source_spans 使用同一合并规则，供流式查找等
+    增量消费规范输出的调用方复用，保证来源区间语义一致。
+    """
+    ordered = sorted(set(points), key=lambda p: (p.chunk_index, p.offset))
+    spans: list[SourceSpan] = []
+    for p in ordered:
+        if (
+            spans
+            and spans[-1].chunk_index == p.chunk_index
+            and spans[-1].end == p.offset
+        ):
+            prev = spans[-1]
+            spans[-1] = SourceSpan(prev.chunk_index, prev.start, p.offset + 1)
+        else:
+            spans.append(SourceSpan(p.chunk_index, p.offset, p.offset + 1))
+    return tuple(spans)
 
 # 迭代 DFS 的栈帧：[码点, 一步子节点(None=未查询), 下一子节点下标, 累加叶子]
 _Frame = list
@@ -366,6 +388,16 @@ class StreamNormalizer:
         self._finished = True
         return self._result
 
+    def flushed_entries(self) -> tuple[_Entry, ...]:
+        """已闭合段冲刷出的输出条目快照：(码点, 来源点元组) 元组。
+
+        已冲刷内容在之后不会再变（ccc 重排与组合只发生在未闭合段内），
+        因此快照前缀只增不改，可供流式查找等增量消费方安全使用。
+        注意：若某次 feed 抛异常，本次 feed 冲刷的条目会随原子回滚撤销；
+        但此时 feed 本身已失败，调用方不应继续使用该次快照。
+        """
+        return tuple(self._out)
+
     def _build_result(self) -> NormalizationResult:
         codepoints = tuple(cp for cp, _ in self._out)
         text = "".join(chr(cp) for cp in codepoints)
@@ -373,20 +405,7 @@ class StreamNormalizer:
         points: set[SourcePoint] = set()
         for _, origins in self._out:
             points.update(origins)
-        ordered = sorted(points, key=lambda p: (p.chunk_index, p.offset))
-
-        spans: list[SourceSpan] = []
-        for p in ordered:
-            if (
-                spans
-                and spans[-1].chunk_index == p.chunk_index
-                and spans[-1].end == p.offset
-            ):
-                prev = spans[-1]
-                spans[-1] = SourceSpan(prev.chunk_index, prev.start, p.offset + 1)
-            else:
-                spans.append(SourceSpan(p.chunk_index, p.offset, p.offset + 1))
-        return NormalizationResult(text, codepoints, tuple(spans))
+        return NormalizationResult(text, codepoints, merge_source_spans(points))
 
 
 def normalize(
