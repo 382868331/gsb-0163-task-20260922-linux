@@ -7,6 +7,7 @@
     DictCharacterTable(...)                          # 字典字符表
     CharacterTable                                   # 字符表协议基类
     NormalizationResult / SourcePoint / SourceSpan   # 结果数据结构
+    StreamSearcher / find_all / Match                # 多模式流式查找
     CanonicalError / InvalidInputError / InvalidTableError /
         DecompositionCycleError / SegmentLimitError  # 错误类型
 
@@ -31,6 +32,7 @@ from .errors import (
     InvalidTableError,
     SegmentLimitError,
 )
+from .search import Match, StreamSearcher, find_all
 from .table import CharacterTable, DictCharacterTable
 from .validators import validate_codepoint
 
@@ -41,6 +43,9 @@ __all__ = [
     "SourceSpan",
     "StreamNormalizer",
     "normalize",
+    "Match",
+    "StreamSearcher",
+    "find_all",
     "CharacterTable",
     "DictCharacterTable",
     "validate_codepoint",

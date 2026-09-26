@@ -92,6 +92,23 @@ _Entry = tuple[int, tuple[SourcePoint, ...]]
 _Frame = list
 
 
+def _points_to_spans(points: Iterable[SourcePoint]) -> tuple[SourceSpan, ...]:
+    """把来源点集合合并为有序半开区间元组（同 chunk 相邻点合并）。"""
+    ordered = sorted(set(points), key=lambda p: (p.chunk_index, p.offset))
+    spans: list[SourceSpan] = []
+    for p in ordered:
+        if (
+            spans
+            and spans[-1].chunk_index == p.chunk_index
+            and spans[-1].end == p.offset
+        ):
+            prev = spans[-1]
+            spans[-1] = SourceSpan(prev.chunk_index, prev.start, p.offset + 1)
+        else:
+            spans.append(SourceSpan(p.chunk_index, p.offset, p.offset + 1))
+    return tuple(spans)
+
+
 def _validate_table_codepoint(value: object, *, owner: int) -> int:
     """校验表返回的码点值，错误归类为 InvalidTableError。"""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -373,20 +390,7 @@ class StreamNormalizer:
         points: set[SourcePoint] = set()
         for _, origins in self._out:
             points.update(origins)
-        ordered = sorted(points, key=lambda p: (p.chunk_index, p.offset))
-
-        spans: list[SourceSpan] = []
-        for p in ordered:
-            if (
-                spans
-                and spans[-1].chunk_index == p.chunk_index
-                and spans[-1].end == p.offset
-            ):
-                prev = spans[-1]
-                spans[-1] = SourceSpan(prev.chunk_index, prev.start, p.offset + 1)
-            else:
-                spans.append(SourceSpan(p.chunk_index, p.offset, p.offset + 1))
-        return NormalizationResult(text, codepoints, tuple(spans))
+        return NormalizationResult(text, codepoints, _points_to_spans(points))
 
 
 def normalize(

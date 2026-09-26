@@ -40,8 +40,8 @@ def _naive_compose(segment, table, ccc_of):
     return [base, *pending]
 
 
-def reference_normalize(chunks, table):
-    """一次性返回 (码点元组, 来源点元组)。
+def _reference_core(chunks, table):
+    """一次性返回 (码点元组, 每个输出码点的来源点集合元组)。
 
     来源点为 ``(chunk_index, offset, stream_offset)``。
     """
@@ -122,6 +122,15 @@ def reference_normalize(chunks, table):
             out_cps.append(cps[i])
             out_points.append(frozenset(bag[i]))
 
+    return tuple(out_cps), tuple(out_points)
+
+
+def reference_normalize(chunks, table):
+    """一次性返回 (码点元组, 来源区间元组)。
+
+    区间为 ``(chunk_index, start, end)`` 半开区间，同 chunk 相邻点已合并。
+    """
+    out_cps, out_points = _reference_core(chunks, table)
     # 展平来源点并合并同 chunk 连续偏移（独立复算区间集合）。
     all_points = set()
     for bag_i in out_points:
@@ -132,4 +141,12 @@ def reference_normalize(chunks, table):
             spans[-1] = (ci, spans[-1][1], off + 1)
         else:
             spans.append((ci, off, off + 1))
-    return tuple(out_cps), tuple(spans)
+    return out_cps, tuple(spans)
+
+
+def reference_normalize_points(chunks, table):
+    """一次性返回 (码点元组, 每个输出码点的来源点 frozenset 元组)。
+
+    供多模式查找的朴素参考按命中区间精确合并来源点（不取最小/最大下标）。
+    """
+    return _reference_core(chunks, table)

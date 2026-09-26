@@ -2,26 +2,34 @@
 
 离线文本基础设施可复用模块：在**调用方显式提供的有限字符表**上执行
 递归分解 → canonical combining class（ccc）稳定排序 → 阻塞二元组合，
-支持跨 chunk 流式处理、来源区间追踪与段长度上限拒绝。
+支持跨 chunk 流式处理、来源区间追踪与段长度上限拒绝；并在规范组合
+后的码点流上提供**多模式流式查找**（模式与文本按同一表规范组合）。
 
 **不读取、不引用系统 Unicode 数据库，不绑定任何 Unicode 版本。**
 本模块只实现本题契约描述的有限算法子集，**不宣称与 Unicode
 NFC/NFD 等行业标准完整兼容**。
 
-## 运行环境
+## 运行环境与 venv 准备
 
 - Python **3.14.7**（仅标准库；更低的 3.10+ 大概率可用但未验收）
 - Linux 原生运行，**无需安装任何第三方依赖**，无需网络/账号/数据库/
   Docker 等。
+- 不需要虚拟环境也能直接运行；若希望隔离解释器，可任选：
+  `python -m venv .venv && . .venv/bin/activate`（纯标准库，
+  `requirements.txt` 为空占位，无需 pip install 任何东西）。
 
 ## 准确命令
 
 ```bash
-# 必要测试（44 个）
+# 必要测试（67 个）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（现场计算，约 2 ms，远小于 8 秒预算；无 sleep、无预录）
+# 规范化演示（现场计算，约 2 ms；无 sleep、无预录）
 python demo.py
+
+# 本轮迭代演示：多模式流式查找 + 非连续来源边界（现场计算，约 1 ms，
+# 远小于 90 秒预算；无 sleep、无预录）
+python demo_iteration.py
 ```
 
 两条命令均在仓库根目录执行。
@@ -32,6 +40,9 @@ python demo.py
 from canoncompose import (
     normalize,            # 一次性 API
     StreamNormalizer,     # 流式 API：feed / finish
+    StreamSearcher,       # 多模式流式查找：feed / finish
+    find_all,             # 一次性多模式查找
+    Match,                # 查找命中（pattern_id/规范区间/来源区间）
     DictCharacterTable,   # 字典字符表
     CharacterTable,       # 字符表协议抽象基类（也可直接鸭子类型）
     NormalizationResult, SourcePoint, SourceSpan,
@@ -80,6 +91,38 @@ result = sn.finish()   # 冲刷最后一段；重复调用返回同一结果
 starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因此未闭合
 的"规范段"保留在流内部，直到遇到下一个 starter 或 `finish()` 才输出。
 
+### 多模式查找 API
+
+```python
+ss = StreamSearcher(table, [(pattern_id, "模式串"), ...], *, segment_limit=1024)
+new_matches = ss.feed(chunk)   # 本次新确认的命中（tuple[Match, ...]，可为空）
+rest = ss.finish()             # 冲刷最后一段后的剩余命中；重复调用返回空元组
+
+# 一次性等价形式：
+matches = find_all(chunks, [(pattern_id, "模式串"), ...], table)
+```
+
+- **同一表规范组合**：每个模式在构造时用同一张表、同一个
+  `segment_limit` 做一次性规范化；文本按 chunk 流式规范化。匹配发生在
+  规范码点序列上（Aho-Corasick，多模式可共用后缀，命中允许重叠）。
+- **不提前 finish**：未闭合的规范段留在核心内部，只有已被冲刷确认的
+  输出码点参与匹配；已确认输出只增不改，因此**已交付的命中在后续输入
+  后不会被撤回**，也不会重复交付。
+- **Match 字段**：
+  - `pattern_id`：登记模式时给的 id（任意可哈希值，不得重复）；
+  - `start` / `end`：规范串上的半开区间 `[start, end)`；
+  - `source_spans`：该命中覆盖的**原输入来源区间集合**
+    （`SourceSpan` 元组，同 chunk 相邻点已合并）。来源可能**不是**
+    连续片段——组合/重排会把不相邻的输入码点并入同一命中，本库按
+    来源点并集精确合并，绝不用最小/最大下标假装连续。
+- **不同原模式规范后相同**：仍分别产生各自的命中，各带各的
+  `pattern_id`。
+- **空模式禁止**：空串模式（或规范后为空的模式）抛
+  `InvalidInputError`；模式必须是 `str`，id 必须可哈希且不重复，
+  模式列表必须是 `(id, str)` 对的可迭代对象。
+- 命中交付顺序：按规范串结束位置升序，同结束位置按开始位置升序，
+  再按模式登记顺序。
+
 ## 算法与阻塞规则（契约）
 
 1. **递归分解**：沿一步分解迭代 DFS 展开到叶子；检测到回到当前 DFS
@@ -117,6 +160,9 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 - 统一基类 `CanonicalError`；输入问题 `InvalidInputError`（`ValueError`
   子类），表返回值问题 `InvalidTableError`，环 `DecompositionCycleError`
   （`InvalidTableError` 子类），超段上限 `SegmentLimitError`。
+- 查找新增输入错误（均为 `InvalidInputError`）：空模式、非 str 模式、
+  重复/不可哈希的模式 id、非 `(id, str)` 对的模式项、`finish()` 后再
+  `feed()`。
 - 错误携带可定位字段：`chunk_index`、chunk 内 `offset`、流上
   `stream_offset`、`codepoint`。
 - **数值输入拒绝 NaN/Infinity；整数参数拒绝 `bool`**（`True`/`False`
@@ -124,7 +170,9 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
   同样拒绝。非法输入不静默纠正。
 - **原子性**：`feed()` 中途任一步失败，本次 feed 对段缓冲、已输出缓冲、
   流偏移、chunk 计数的修改全部回滚，流恢复到调用前状态，可继续使用；
-  `normalize()` 不返回部分结果（成功或抛异常）。
+`normalize()` 不返回部分结果（成功或抛异常）。
+- 查找的 `feed()` 在底层规范化 feed 成功后才推进匹配状态；底层原子
+  回滚时查找状态不变，流可继续使用。
 - 本算法**没有搜索预算/无解证明**之类概念（确定性结构变换），因此不
   存在"预算耗尽 vs 无解"的区分需求；能失败的情形都是显式非法输入/表/
   上限，错误类型如上分开。
@@ -157,6 +205,9 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 - 来源区间以输入 chunk 的码点偏移表示；surrogate/编码层问题不存在
   （输入是 Python `str`，按码点遍历）。
 - 超长单段（如单个分解出 1025+ 叶子的码点）直接拒绝，不做降级输出。
+- 查找是规范码点序列上的精确多模式匹配：不做模糊/正则/大小写折叠，
+  不扩大成完整 Unicode 搜索引擎；模式集合在构造时固定，运行中不可增删。
+- 命中的来源区间坐标依赖 chunk 划分（与规范化来源区间同一约定）。
 
 ## 目录
 
@@ -164,15 +215,20 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 canoncompose/          # 本题库
   __init__.py          # 公开接口
   engine.py            # 流式核心（分解/排序/组合/上限/原子回滚）
+  search.py            # 多模式流式查找（Aho-Corasick + 来源区间合并）
   table.py             # 字符表协议与字典实现
   samples.py           # 确定性 PUA 示例表（含环表构造）
   errors.py            # 错误类型与定位字段
   validators.py        # 数值/码点校验
 tests/
-  test_normalize.py    # 必要测试（44 个）
+  test_normalize.py    # 规范化必要测试（44 个）
+  test_search.py       # 多模式查找必要测试（23 个）
   reference.py         # 独立一次性朴素参考实现（不导入被测核心）
 demo.py                # 固定输入演示
+demo_iteration.py       # 本轮迭代演示：多模式查找 + 非连续来源边界
 ```
 
 测试中的期望值来自 `tests/reference.py` 里独立编写的朴素分解-排序-组合
-实现（**不调用被测核心**）；与被测结果的往返一致只作为补充断言。
+实现（**不调用被测核心**）；查找测试另对短输入**枚举全部切块位置**，
+与"整串规范化后朴素滑窗匹配"的参考结果逐一对比（含递归分解、前导
+组合符、多模式共用后缀等用例）；往返一致只作为补充断言。
