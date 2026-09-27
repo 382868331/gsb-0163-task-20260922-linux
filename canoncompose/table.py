@@ -16,16 +16,25 @@
     相邻二元组合映射：仅当返回码点而非 ``None`` 时才发生组合。
     是否允许调用还受核心的阻塞规则约束（见 :mod:`canoncompose.engine`）。
 
-返回值会被核心逐一校验，类型或范围非法时抛
-:class:`~canoncompose.errors.InvalidTableError`。
+为了在文本处理前完成全量检查，可枚举表还应提供 ``table_entries()``，
+返回 ``(decompositions, combining_classes, compositions)`` 三个映射。
+:class:`DictCharacterTable` 已内置该方法。编译期发现的类型、范围、环、
+组合矛盾或 ccc 等级问题均抛
+:class:`~canoncompose.errors.InvalidTableError`，错误携带具体表项。
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Mapping
+from typing import Mapping, NamedTuple
 
-__all__ = ["CharacterTable", "DictCharacterTable"]
+__all__ = ["CharacterTable", "DictCharacterTable", "TableMappings"]
+
+
+class TableMappings(NamedTuple):
+    decompositions: Mapping[int, tuple[int, ...]]
+    combining_classes: Mapping[int, int]
+    compositions: Mapping[tuple[int, int], int]
 
 
 class CharacterTable(ABC):
@@ -70,3 +79,7 @@ class DictCharacterTable(CharacterTable):
 
     def composition(self, left: int, right: int) -> int | None:
         return self._comp.get((left, right))
+
+    def table_entries(self) -> TableMappings:
+        """导出全部有限表项，供编译期完整检查。"""
+        return TableMappings(self._decomp, self._ccc, self._comp)

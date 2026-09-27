@@ -16,6 +16,7 @@ from canoncompose import (
     NormalizationResult,
     SegmentLimitError,
     StreamNormalizer,
+    compile_table,
     DecompositionCycleError,
     InvalidInputError,
     InvalidTableError,
@@ -264,29 +265,28 @@ class CycleTests(unittest.TestCase):
         self.assertIn(0xE200, chain)
         self.assertIn(0xE201, chain)
 
-    def test_cycle_detection_is_local_and_stream_survives(self) -> None:
-        # 失败 feed 原子回滚后，流仍可继续处理正常数据。
+    def test_cycle_is_found_before_text_processing(self) -> None:
         table = build_cyclic_table()
-        sn = StreamNormalizer(table)
-        sn.feed("a")
         with self.assertRaises(DecompositionCycleError):
-            sn.feed(chr(0xE200))
-        result = sn.finish()
-        self.assertEqual(result.text, "a")
+            compile_table(table)
 
-    def test_failed_feed_does_not_consume_chunk_index(self) -> None:
-        # 回滚包含 chunk 计数：失败后下一次成功 feed 的来源仍是 chunk 1。
-        table = build_cyclic_table()
-        sn = StreamNormalizer(table)
-        sn.feed("a")  # chunk 0
+    def test_failed_compilation_does_not_affect_previous_table(self) -> None:
+        good = compile_table(build_demo_table())
+        stream = StreamNormalizer(good)
+        stream.feed("a")
         with self.assertRaises(DecompositionCycleError):
-            sn.feed(chr(0xE200))  # 失败的 chunk 1
-        sn.feed("e")  # 仍应记为 chunk 1
-        result = sn.finish()
-        self.assertEqual(result.text, "ae")
-        self.assertEqual(
-            _spans(result), ((0, 0, 1), (1, 0, 1))
-        )
+            compile_table(build_cyclic_table())
+        stream.feed("e")
+        self.assertEqual(stream.finish().text, "ae")
+
+    def test_compiled_table_is_shared_by_independent_streams(self) -> None:
+        compiled = compile_table(build_demo_table())
+        first = StreamNormalizer(compiled)
+        second = StreamNormalizer(compiled)
+        first.feed(chr(A) + chr(M_GRAVE))
+        second.feed(chr(E) + chr(M_ACUTE))
+        self.assertEqual(first.finish().codepoints, (P_A_GRAVE,))
+        self.assertEqual(second.finish().codepoints, (P_E_ACUTE,))
 
     def test_indirect_cycle_through_normal_prefix(self) -> None:
         # Z(普通) → X → Y → X：环仍可定位。
@@ -351,6 +351,103 @@ class SegmentLimitTests(unittest.TestCase):
         self.assertEqual(len(result.codepoints), 2000)
 
 
+class TableCompilationTests(unittest.TestCase):
+    def test_compiled_table_is_returned_unchanged(self) -> None:
+        compiled = compile_table(build_demo_table())
+        self.assertIs(compile_table(compiled), compiled)
+
+    def test_compile_rejects_contradictory_composition(self) -> None:
+        other = 0xE180
+        table = DictCharacterTable(
+            decompositions={
+                P_A_GRAVE: (A, M_GRAVE),
+                other: (E, M_ACUTE),
+            },
+            combining_classes={M_GRAVE: 230, M_ACUTE: 230},
+            compositions={(A, M_GRAVE): other},
+        )
+        with self.assertRaises(InvalidTableError) as ctx:
+            compile_table(table)
+        self.assertIn("contradicts recursive decomposition", str(ctx.exception))
+        self.assertEqual(ctx.exception.entry.kind, "composition")
+
+    def test_compile_rejects_non_starter_left_operand(self) -> None:
+        table = DictCharacterTable(
+            combining_classes={M_GRAVE: 230, M_ACUTE: 230},
+            compositions={(M_GRAVE, M_ACUTE): P_A_GRAVE},
+        )
+        with self.assertRaises(InvalidTableError) as ctx:
+            compile_table(table)
+        self.assertIn("left operand ccc", str(ctx.exception))
+        self.assertEqual(ctx.exception.entry.key, (M_GRAVE, M_ACUTE))
+
+    def test_compile_rejects_starter_right_operand(self) -> None:
+        target = 0xE180
+        table = DictCharacterTable(
+            compositions={(A, E): target},
+        )
+        with self.assertRaises(InvalidTableError) as ctx:
+            compile_table(table)
+        self.assertIn("right operand ccc", str(ctx.exception))
+        self.assertEqual(ctx.exception.codepoint, E)
+
+    def test_compile_rejects_non_starter_composition_result(self) -> None:
+        table = DictCharacterTable(
+            combining_classes={M_GRAVE: 230, P_A_GRAVE: 230},
+            compositions={(A, M_GRAVE): P_A_GRAVE},
+        )
+        with self.assertRaises(InvalidTableError) as ctx:
+            compile_table(table)
+        self.assertIn("composition result ccc", str(ctx.exception))
+        self.assertEqual(ctx.exception.codepoint, P_A_GRAVE)
+
+    def test_compile_rejects_starter_after_nonstarter_decomposition(self) -> None:
+        table = DictCharacterTable(
+            decompositions={P_A_GRAVE: (A, M_GRAVE, E)},
+            combining_classes={M_GRAVE: 230},
+            compositions={(A, M_GRAVE): P_A_GRAVE},
+        )
+        with self.assertRaises(InvalidTableError) as ctx:
+            compile_table(table)
+        self.assertIn("starter after a non-starter", str(ctx.exception))
+        self.assertEqual(ctx.exception.codepoint, P_A_GRAVE)
+
+    def test_compile_rejects_nonstarter_recursive_expansion_with_starter(self) -> None:
+        intermediate = 0xE181
+        table = DictCharacterTable(
+            decompositions={
+                M_GRAVE: (intermediate,),
+                intermediate: (A, M_ACUTE),
+            },
+            combining_classes={M_GRAVE: 230, M_ACUTE: 230},
+            compositions={(A, M_ACUTE): intermediate},
+        )
+        with self.assertRaises(InvalidTableError) as ctx:
+            compile_table(table)
+        self.assertIn("non-starter decomposition contains a starter", str(ctx.exception))
+        self.assertEqual(ctx.exception.codepoint, M_GRAVE)
+
+    def test_compiled_table_snapshot_is_independent(self) -> None:
+        source = build_demo_table()
+        compiled = compile_table(source)
+        source.table_entries = None  # type: ignore[method-assign]
+        first = StreamNormalizer(compiled)
+        second = StreamNormalizer(compiled)
+        first.feed(chr(A) + chr(M_GRAVE))
+        second.feed(chr(E) + chr(M_ACUTE))
+        self.assertEqual(first.finish().codepoints, (P_A_GRAVE,))
+        self.assertEqual(second.finish().codepoints, (P_E_ACUTE,))
+
+    def test_compiled_table_survives_source_mapping_mutation(self) -> None:
+        source = build_demo_table()
+        compiled = compile_table(source)
+        source.table_entries().decompositions.clear()
+        source.table_entries().combining_classes.clear()
+        source.table_entries().compositions.clear()
+        result = normalize([chr(A) + chr(M_GRAVE)], compiled)
+        self.assertEqual(result.codepoints, (P_A_GRAVE,))
+
+
 class InvalidInputTests(unittest.TestCase):
     def setUp(self) -> None:
         self.table = build_demo_table()
@@ -385,8 +482,8 @@ class InvalidInputTests(unittest.TestCase):
         with self.assertRaises(InvalidInputError):
             normalize(123, self.table)  # type: ignore[arg-type]
 
-    def test_table_without_methods_rejected(self) -> None:
-        with self.assertRaises(InvalidInputError):
+    def test_non_enumerable_table_rejected_at_compilation(self) -> None:
+        with self.assertRaises(InvalidTableError):
             StreamNormalizer(object())
 
     def test_error_is_value_error_and_base_exception(self) -> None:
@@ -400,12 +497,16 @@ class InvalidInputTests(unittest.TestCase):
 
 class InvalidTableTests(unittest.TestCase):
     def test_decomposition_must_be_tuple_or_none(self) -> None:
-        class T(DictCharacterTable):
-            def decomposition(self, cp):
-                return [A] if cp == 1 else None
-
+        class T:
+            @staticmethod
+            def table_entries():
+                return {
+                    "decompositions": {1: [A]},
+                    "combining_classes": {},
+                    "compositions": {},
+                }
         with self.assertRaises(InvalidTableError):
-            normalize([chr(1)], T())
+            compile_table(T())
 
     def test_decomposition_empty_tuple_rejected(self) -> None:
         table = DictCharacterTable(decompositions={1: ()})
@@ -418,21 +519,27 @@ class InvalidTableTests(unittest.TestCase):
             normalize([chr(1)], table)
 
     def test_ccc_must_be_non_negative_int(self) -> None:
-        class T(DictCharacterTable):
-            def combining_class(self, cp):
-                if cp == A:
-                    return -1
-                return 0
-
+        class T:
+            @staticmethod
+            def table_entries():
+                return {
+                    "decompositions": {},
+                    "combining_classes": {A: -1},
+                    "compositions": {},
+                }
         with self.assertRaises(InvalidTableError):
-            normalize(["a"], T())
+            compile_table(T())
 
-        class T2(DictCharacterTable):
-            def combining_class(self, cp):
-                return True if cp == A else 0
-
+        class T2:
+            @staticmethod
+            def table_entries():
+                return {
+                    "decompositions": {},
+                    "combining_classes": {A: True},
+                    "compositions": {},
+                }
         with self.assertRaises(InvalidTableError):
-            normalize(["a"], T2())
+            compile_table(T2())
 
     def test_composition_out_of_range_rejected(self) -> None:
         table = DictCharacterTable(
@@ -442,24 +549,15 @@ class InvalidTableTests(unittest.TestCase):
         with self.assertRaises(InvalidTableError):
             normalize([chr(A), chr(M_ACUTE)], table)
 
-    def test_bad_table_return_feed_is_atomic(self) -> None:
-        class BadAfterFirst(DictCharacterTable):
-            calls = 0
-
-            def combining_class(self, cp):
-                if cp == M_ACUTE:
-                    BadAfterFirst.calls += 1
-                    if BadAfterFirst.calls >= 1:
-                        raise RuntimeError("table storage corrupted")
-                return super().combining_class(cp)
-
-        table = BadAfterFirst(combining_classes={M_ACUTE: 230})
-        sn = StreamNormalizer(table)
-        sn.feed("e")
-        with self.assertRaises(RuntimeError):
-            sn.feed(chr(A) + chr(M_ACUTE))
-        # 回滚后仍可得到早先内容。
-        self.assertEqual(sn.finish().text, "e")
+    def test_error_points_to_specific_table_entry(self) -> None:
+        table = DictCharacterTable(
+            compositions={(A, M_ACUTE): P_E_ACUTE},
+            combining_classes={M_ACUTE: 0},
+        )
+        with self.assertRaises(InvalidTableError) as ctx:
+            compile_table(table)
+        self.assertIsNotNone(ctx.exception.entry)
+        self.assertIn("composition", str(ctx.exception))
 
 
 class SourceSpanTests(unittest.TestCase):

@@ -17,7 +17,7 @@ NFC/NFD 等行业标准完整兼容**。
 ## 准确命令
 
 ```bash
-# 必要测试（44 个）
+# 必要测试（54 个）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（现场计算，约 2 ms，远小于 8 秒预算；无 sleep、无预录）
@@ -34,6 +34,7 @@ from canoncompose import (
     StreamNormalizer,     # 流式 API：feed / finish
     DictCharacterTable,   # 字典字符表
     CharacterTable,       # 字符表协议抽象基类（也可直接鸭子类型）
+    CompiledCharacterTable, compile_table,  # 显式检查/编译
     NormalizationResult, SourcePoint, SourceSpan,
     CanonicalError, InvalidInputError, InvalidTableError,
     DecompositionCycleError, SegmentLimitError,
@@ -42,7 +43,7 @@ from canoncompose import (
 
 ### 字符表协议
 
-表对象提供三个方法，返回值会被逐一校验：
+表对象提供三个查询方法：
 
 | 方法 | 语义 |
 |---|---|
@@ -50,13 +51,45 @@ from canoncompose import (
 | `combining_class(cp) -> int` | ccc 非负整数；`0` 为 starter。未列出的码点惯例返回 `0`。 |
 | `composition(left, right) -> int \| None` | 二元组合映射；返回码点才组合，`None` 不组合。是否调用还受阻塞规则约束。 |
 
-码点为 `0..0x10FFFF` 的 `int`。
+码点为 `0..0x10FFFF` 的 `int`。为了在开始处理文本前做**全量检查**，
+表还应提供 `table_entries()`，返回
+`(decompositions, combining_classes, compositions)` 三个映射；
+`DictCharacterTable` 已内置该方法。只实现三个惰性查询方法的不可枚举表
+无法完整编译，会被拒绝。
+
+### 表检查与编译
+
+```python
+compiled = compile_table(table)   # 失败：抛 InvalidTableError/DecompositionCycleError
+sn1 = StreamNormalizer(compiled)  # 多个独立文本流复用同一张快照
+sn2 = StreamNormalizer(compiled)
+```
+
+`compile_table()` 成功后返回 `CompiledCharacterTable` 不可变快照，并在
+编译期预先计算递归展开。检查在任何输入 chunk 校验/处理前发生：
+
+- 分解表项必须是非空码点元组，递归分解图不得有环；
+- ccc 表项必须是非负整数；分解中 starter 后不得再出现 starter，非 starter
+  的 ccc 必须非降序；
+- 组合键必须是两个码点，左码点 ccc 必须为 `0`，右码点 ccc 必须为正数，
+  组合结果 ccc 必须为 `0`；
+- 若组合结果本身也给了分解，则其递归叶子序列必须与“左码点递归展开 +
+  右码点递归展开”完全一致；这用于发现矛盾组合；
+- 错误的 `entry` 字段指向具体 `decomposition[source]`、
+  `combining_class[codepoint]` 或 `composition(left, right)` 表项，不只报
+  “无效字符表”。
+
+失败的编译只抛出异常，不返回半编译对象，也不会修改先前已经成功的
+`CompiledCharacterTable` 或正在使用它的独立流。
 
 ### 一次性 API
 
 ```python
 result = normalize(chunks, table, *, segment_limit=1024)
 ```
+
+直接传入原始表时，API 内部会先执行上述编译；需要多个文本流共享结果时，
+显式调用一次 `compile_table()` 后传入编译表。
 
 - `chunks`：`str` 的**可迭代对象**（`list[str]`、生成器等）；直接传单个
   `str` 会被拒绝（防止把字符串误当字符序列）。
@@ -82,9 +115,9 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 
 ## 算法与阻塞规则（契约）
 
-1. **递归分解**：沿一步分解迭代 DFS 展开到叶子；检测到回到当前 DFS
-   路径上节点的边即判定成环，抛 `DecompositionCycleError`（异常的
-   `chain` 字段给出闭合路径）。已验证无环的子树结果缓存复用。
+1. **编译与递归分解**：先完整编译表并检测分解环，抛
+   `DecompositionCycleError`（异常的 `chain` 字段给出闭合路径）；编译表
+   保存每个有分解码点的递归叶子序列，后续多个流直接复用。
 2. **稳定 ccc 排序**：段 = 一个 starter（ccc=0）及其后到下一 starter
    前的非 starter；非 starter 按 ccc **非降序稳定排列**（等 ccc 保持来源
    先后）。流开头先出现的非 starter 构成无 starter 的前导段：只排序，
@@ -119,9 +152,12 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
   （`InvalidTableError` 子类），超段上限 `SegmentLimitError`。
 - 错误携带可定位字段：`chunk_index`、chunk 内 `offset`、流上
   `stream_offset`、`codepoint`。
+- 表编译错误携带 `entry`（`TableEntry`），其 `kind` 为
+  `decomposition`、`combining_class` 或 `composition`，`key` 给出具体源
+  码点或 `(left, right)` 组合键。
 - **数值输入拒绝 NaN/Infinity；整数参数拒绝 `bool`**（`True`/`False`
-  虽为 `int` 子类也拒绝）；非 str chunk、非可迭代 chunks、缺方法的表
-  同样拒绝。非法输入不静默纠正。
+  虽为 `int` 子类也拒绝）；非 str chunk、非可迭代 chunks 是输入错误，
+  缺方法或不可枚举的表是编译期表错误。非法输入不静默纠正。
 - **原子性**：`feed()` 中途任一步失败，本次 feed 对段缓冲、已输出缓冲、
   流偏移、chunk 计数的修改全部回滚，流恢复到调用前状态，可继续使用；
   `normalize()` 不返回部分结果（成功或抛异常）。
@@ -137,7 +173,7 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
 
 ## 设计取舍
 
-- 表只给**一步**分解：递归、环检测、展开缓存由核心负责，表实现最简。
+- 表只给**一步**分解：递归、环检测、展开预计算由编译器负责，表实现最简。
 - 排序采用"插入时稳定定位"而非段末整体排序，使跨 chunk 挂起段无需
   缓存排序键以外的额外结构；两者在稳定序下等价。
 - 组合发生在**段闭合**时（下一个 starter 或 finish），保证跨块记号有
@@ -145,15 +181,16 @@ starter 之后的非 starter 可能与**后续 chunk** 内容重排/组合，因
   固有特征。
 - 来源区间按"输出码点 → 输入来源点并集 → 同 chunk 连续点合并"计算，
   语义直观；不尝试输出字符级的多层 provenance 树。
-- 表查询结果（分解叶子、ccc）在单次运行内缓存：既加速重复码点，也
-  保证运行内表视图一致；表在运行中途被外部修改属于未定义用法。
+- 编译结果是快照：所有映射和递归展开在编译期固定，多个独立流可安全
+  复用；原始表在编译后再被外部修改不影响已返回的编译表。
 
 ## 已知限制
 
 - 只实现本题契约的子集：不做兼容分解、重排（reordering 之外的
   normalization 形式）、singleton 分解、quick-check、流控等，不保证
   接受任意 Unicode 表后与 NFC/NFKC 一致。
-- 不校验组合结果自身的 ccc 或分解一致性（表自洽性由调用方负责）。
+- 编译器只能完整检查可枚举的有限表；惰性且不导出 `table_entries()` 的
+  表无法证明全局无环或无矛盾，因此不会进入文本处理。
 - 来源区间以输入 chunk 的码点偏移表示；surrogate/编码层问题不存在
   （输入是 Python `str`，按码点遍历）。
 - 超长单段（如单个分解出 1025+ 叶子的码点）直接拒绝，不做降级输出。
@@ -165,11 +202,12 @@ canoncompose/          # 本题库
   __init__.py          # 公开接口
   engine.py            # 流式核心（分解/排序/组合/上限/原子回滚）
   table.py             # 字符表协议与字典实现
+  compiler.py          # 表的全量检查、递归展开预计算与不可变快照
   samples.py           # 确定性 PUA 示例表（含环表构造）
   errors.py            # 错误类型与定位字段
   validators.py        # 数值/码点校验
 tests/
-  test_normalize.py    # 必要测试（44 个）
+  test_normalize.py    # 必要测试（54 个）
   reference.py         # 独立一次性朴素参考实现（不导入被测核心）
 demo.py                # 固定输入演示
 ```

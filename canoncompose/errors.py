@@ -13,6 +13,7 @@ __all__ = [
     "InvalidTableError",
     "DecompositionCycleError",
     "SegmentLimitError",
+    "TableEntry",
 ]
 
 
@@ -79,13 +80,45 @@ class InvalidInputError(CanonicalError, ValueError):
 class InvalidTableError(CanonicalError, ValueError):
     """字符表内容非法（返回值类型/范围不合法等）。
 
-    - ``codepoint``：触发表查询的码点（如有）。
+    - ``codepoint``：触发表查询的码点（如有）；
+    - ``entry``：出错的具体表项（如有）。
     """
 
-    def __init__(self, message: str, *, codepoint: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        codepoint: int | None = None,
+        entry: "TableEntry | None" = None,
+    ) -> None:
         cp_part = f" [{_hex_cp(codepoint)}]" if codepoint is not None else ""
-        super().__init__(f"{message}{cp_part}")
+        entry_part = f" (at {entry})" if entry is not None else ""
+        super().__init__(f"{message}{entry_part}{cp_part}")
         self.codepoint = codepoint
+        self.entry = entry
+
+
+class TableEntry:
+    """字符表中的具体条目位置，供编译错误定位。"""
+
+    __slots__ = ("kind", "key")
+
+    DECOMPOSITION = "decomposition"
+    COMBINING_CLASS = "combining_class"
+    COMPOSITION = "composition"
+
+    def __init__(self, kind: str, key: object) -> None:
+        self.kind = kind
+        self.key = key
+
+    def __str__(self) -> str:
+        try:
+            if self.kind == self.COMPOSITION:
+                left, right = self.key
+                return f"{self.kind}({_hex_cp(left)}, {_hex_cp(right)})"
+            return f"{self.kind}[{_hex_cp(self.key)}]"
+        except (TypeError, ValueError):
+            return f"{self.kind}({self.key!r})"
 
 
 class DecompositionCycleError(InvalidTableError):

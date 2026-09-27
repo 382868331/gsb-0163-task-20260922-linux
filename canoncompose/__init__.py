@@ -24,12 +24,14 @@ from .engine import (
     StreamNormalizer,
     normalize,
 )
+from .compiler import CompiledCharacterTable, compile_table
 from .errors import (
     CanonicalError,
     DecompositionCycleError,
     InvalidInputError,
     InvalidTableError,
     SegmentLimitError,
+    TableEntry,
 )
 from .table import CharacterTable, DictCharacterTable
 from .validators import validate_codepoint
@@ -43,12 +45,15 @@ __all__ = [
     "normalize",
     "CharacterTable",
     "DictCharacterTable",
+    "CompiledCharacterTable",
+    "compile_table",
     "validate_codepoint",
     "CanonicalError",
     "InvalidInputError",
     "InvalidTableError",
     "DecompositionCycleError",
     "SegmentLimitError",
+    "TableEntry",
 ]
 
 __version__ = "1.0.0"

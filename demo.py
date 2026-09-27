@@ -25,6 +25,7 @@ from canoncompose import (
     DecompositionCycleError,
     SegmentLimitError,
     StreamNormalizer,
+    compile_table,
     normalize,
 )
 from canoncompose.samples import (
@@ -51,7 +52,7 @@ def _format_spans(spans) -> str:
 
 def main() -> None:
     started = time.perf_counter()
-    table = build_demo_table()
+    table = compile_table(build_demo_table())
 
     # 固定输入：两级预组合 + 需要 ccc 重排的记号 + 可组合段 + 普通 starter。
     text = (
@@ -95,14 +96,19 @@ def main() -> None:
 
     print()
     print("=" * 68)
-    print("4. 拒绝边界 A：循环分解表（真实触发）")
+    print("4. 拒绝边界 A：循环分解表在编译期被拒绝（真实触发）")
     print("-" * 68)
     try:
-        normalize([chr(0xE200)], build_cyclic_table())
+        compile_table(build_cyclic_table())
     except DecompositionCycleError as exc:
         rendered = " -> ".join(f"U+{cp:04X}" for cp in exc.chain)
         print(f"捕获 {type(exc).__name__}: {exc}")
         print(f"检测到的环: {rendered}")
+    after_failure = normalize([chr(A) + chr(M_GRAVE)], table)
+    print(
+        "先前已编译表仍可处理独立流:",
+        describe(after_failure.codepoints),
+    )
 
     print()
     print("=" * 68)
