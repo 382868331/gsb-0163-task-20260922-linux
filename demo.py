@@ -22,9 +22,12 @@ from __future__ import annotations
 import time
 
 from canoncompose import (
+    CompositionConflictError,
     DecompositionCycleError,
+    InconsistentLevelError,
     SegmentLimitError,
     StreamNormalizer,
+    compile_table,
     normalize,
 )
 from canoncompose.samples import (
@@ -36,8 +39,10 @@ from canoncompose.samples import (
     O,
     P_A_GRAVE,
     P_A_GRAVE_RING,
+    build_contradictory_table,
     build_cyclic_table,
     build_demo_table,
+    build_inconsistent_level_table,
     describe,
 )
 from canoncompose.table import DictCharacterTable
@@ -53,6 +58,13 @@ def main() -> None:
     started = time.perf_counter()
     table = build_demo_table()
 
+    print("=" * 68)
+    print("0. 表编译：处理文本前的一致性检查（compile_table）")
+    print("-" * 68)
+    compiled = compile_table(table)
+    print("表演示数据编译通过，得到可复用的 CompiledCharacterTable。")
+    print("P_A_GRAVE_RING 的预计算展开:", describe(compiled.expansion(P_A_GRAVE_RING)))
+
     # 固定输入：两级预组合 + 需要 ccc 重排的记号 + 可组合段 + 普通 starter。
     text = (
         chr(P_A_GRAVE_RING)
@@ -64,7 +76,8 @@ def main() -> None:
     print("1. 一次性规范化（正常结果）")
     print("-" * 68)
     print("输入码点:", describe(tuple(ord(c) for c in text)))
-    result = normalize([text], table)
+    # 通过编译的表重复用于多个相互独立的文本流。
+    result = normalize([text], compiled)
     print("规范码点:", describe(result.codepoints))
     print("来源区间:", _format_spans(result.source_spans))
 
@@ -76,7 +89,7 @@ def main() -> None:
     chunks = [text[:2], text[2:5], text[5:]]
     for i, ch in enumerate(chunks):
         print(f"feed chunk {i}: {describe(tuple(ord(c) for c in ch))}")
-    stream = StreamNormalizer(table)
+    stream = StreamNormalizer(compiled)
     for ch in chunks:
         stream.feed(ch)
     streamed = stream.finish()
@@ -88,14 +101,14 @@ def main() -> None:
     print("=" * 68)
     print("3. 幂等：对规范串再规范化一次")
     print("-" * 68)
-    second = normalize([result.text], table)
+    second = normalize([result.text], compiled)
     print("二次结果:", describe(second.codepoints))
     assert second.codepoints == result.codepoints, "规范化不幂等"
     print("=> 规范串再规范化保持不变 ✓")
 
     print()
     print("=" * 68)
-    print("4. 拒绝边界 A：循环分解表（真实触发）")
+    print("4. 拒绝边界 A：循环分解表（真实触发，运行期检测）")
     print("-" * 68)
     try:
         normalize([chr(0xE200)], build_cyclic_table())
@@ -121,6 +134,30 @@ def main() -> None:
         print(f"捕获 {type(exc).__name__}: {exc}")
         print(f"上限={exc.limit}，尝试达到={exc.actual}，定位=chunk "
               f"{exc.chunk_index} 流偏移 {exc.stream_offset}")
+
+    elapsed = time.perf_counter() - started
+    print()
+    print("=" * 68)
+    print("6. 拒绝边界 C：编译期检查出矛盾组合与不一致的组合等级（真实触发）")
+    print("-" * 68)
+    try:
+        compile_table(build_contradictory_table())
+    except CompositionConflictError as exc:
+        print(f"捕获 {type(exc).__name__}: {exc}")
+        print(
+            "矛盾表项: composition(",
+            describe((exc.left, exc.right)),
+            ") ->",
+            describe((exc.result,)),
+        )
+    try:
+        compile_table(build_inconsistent_level_table())
+    except InconsistentLevelError as exc:
+        print(f"捕获 {type(exc).__name__}: {exc}")
+        print(f"问题表项: {exc.entry}，码点 U+{exc.codepoint:04X}")
+    # 编译失败不影响先前已编译的表。
+    still_ok = normalize([chr(P_A_GRAVE)], compiled)
+    print("先前编译的表仍可用:", describe(still_ok.codepoints))
 
     elapsed = time.perf_counter() - started
     print()

@@ -62,6 +62,21 @@ class DictCharacterTable(CharacterTable):
         self._ccc: dict[int, int] = dict(combining_classes or {})
         self._comp: dict[tuple[int, int], int] = dict(compositions or {})
 
+    @property
+    def decompositions(self) -> Mapping[int, tuple[int, ...]]:
+        """有限分解表项的只读副本（供 compile_table 枚举）。"""
+        return dict(self._decomp)
+
+    @property
+    def combining_classes(self) -> Mapping[int, int]:
+        """有限 ccc 表项的只读副本（未列出码点按 0）。"""
+        return dict(self._ccc)
+
+    @property
+    def compositions(self) -> Mapping[tuple[int, int], int]:
+        """有限组合表项的只读副本。"""
+        return dict(self._comp)
+
     def decomposition(self, codepoint: int) -> tuple[int, ...] | None:
         return self._decomp.get(codepoint)
 

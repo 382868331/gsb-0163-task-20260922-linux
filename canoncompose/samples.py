@@ -8,7 +8,9 @@
 - 链式组合（a + grave → agrave，agrave + ring(232) → a-grave-ring）；
 - 同 ccc 阻塞（grave/acute 同为 230，未组合的前者阻塞后者）；
 - 跨块挂起段；
-- 分解环（:func:`build_cyclic_table`）。
+- 分解环（:func:`build_cyclic_table`）；
+- 矛盾组合表（:func:`build_contradictory_table`）；
+- 组合等级不一致表（:func:`build_inconsistent_level_table`）。
 """
 
 from __future__ import annotations
@@ -31,6 +33,8 @@ __all__ = [
     "CYCLE_Y",
     "build_demo_table",
     "build_cyclic_table",
+    "build_contradictory_table",
+    "build_inconsistent_level_table",
     "describe",
 ]
 
@@ -91,6 +95,44 @@ def build_cyclic_table() -> DictCharacterTable:
         },
         combining_classes={},
         compositions={},
+    )
+
+
+def build_contradictory_table() -> DictCharacterTable:
+    """返回组合映射与分解映射互相矛盾的表。
+
+    组合项 (a, grave) -> P_O_ACUTE，但 P_O_ACUTE 分解为 (o, acute)，
+    与 (a, grave) 自身的展开不一致：编译期必须拒绝。
+    """
+    return DictCharacterTable(
+        decompositions={
+            P_O_ACUTE: (O, M_ACUTE),
+        },
+        combining_classes={
+            M_GRAVE: 230,
+            M_ACUTE: 230,
+        },
+        compositions={
+            (A, M_GRAVE): P_O_ACUTE,
+        },
+    )
+
+
+def build_inconsistent_level_table() -> DictCharacterTable:
+    """返回组合结果等级不一致的表。
+
+    组合项 (a, grave) -> M_RING，但 M_RING 的 ccc 为 232（非 starter），
+    组合结果必须占据基字符位置（ccc 0）：编译期必须拒绝。
+    """
+    return DictCharacterTable(
+        decompositions={},
+        combining_classes={
+            M_GRAVE: 230,
+            M_RING: 232,
+        },
+        compositions={
+            (A, M_GRAVE): M_RING,
+        },
     )
 
 

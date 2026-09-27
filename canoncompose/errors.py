@@ -12,6 +12,9 @@ __all__ = [
     "InvalidInputError",
     "InvalidTableError",
     "DecompositionCycleError",
+    "TableCompilationError",
+    "CompositionConflictError",
+    "InconsistentLevelError",
     "SegmentLimitError",
 ]
 
@@ -99,6 +102,88 @@ class DecompositionCycleError(InvalidTableError):
         rendered = " -> ".join(_hex_cp(cp) for cp in chain)
         super().__init__(f"decomposition cycle detected: {rendered}")
         self.chain = chain
+
+
+class TableCompilationError(InvalidTableError):
+    """字符表编译（事前一致性检查）失败的公共基类。
+
+    所有编译期错误都指向具体表项，便于调用方定位修正。
+    """
+
+
+class CompositionConflictError(TableCompilationError):
+    """组合映射与分解映射互相矛盾。
+
+    组合项 (left, right) -> result 要求 result 的递归分解叶子序列与
+    left、right 各自递归分解叶子的拼接完全一致，否则规范化结果依赖
+    处理路径，表自身矛盾。
+
+    - left / right / result：矛盾组合项的三个码点；
+    - expected：left、right 递归分解叶子的拼接；
+    - actual：result 的递归分解叶子。
+    """
+
+    def __init__(
+        self,
+        left: int,
+        right: int,
+        result: int,
+        expected: tuple[int, ...],
+        actual: tuple[int, ...],
+    ) -> None:
+        exp = " ".join(_hex_cp(cp) for cp in expected)
+        act = " ".join(_hex_cp(cp) for cp in actual)
+        super().__init__(
+            "composition contradicts decomposition: "
+            f"composition({_hex_cp(left)}, {_hex_cp(right)}) = "
+            f"{_hex_cp(result)}, but the pair expands to ({exp}) "
+            f"while the result expands to ({act})",
+            codepoint=result,
+        )
+        self.left = left
+        self.right = right
+        self.result = result
+        self.expected = expected
+        self.actual = actual
+
+
+class InconsistentLevelError(TableCompilationError):
+    """表项的 canonical combining class（组合等级）不一致。
+
+    entry 字段指明出问题的表项种类与定位：
+
+    - "decomposition"：codepoint 的分解首元素等级与该字符自身等级
+      不一致（规范分解保持首元素等级）；
+    - "composition-second"：组合项 (left, right) 的右元素等级为 0
+      （starter 不可能作为被组合的记号）；
+    - "composition-result"：组合结果 codepoint 的等级非 0
+      （组合结果占据基字符位置，必须是 starter）。
+
+    携带字段：entry、codepoint、left/right（组合项时）、
+    expected_ccc、actual_ccc。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        entry: str,
+        codepoint: int,
+        expected_ccc: int,
+        actual_ccc: int,
+        left: int | None = None,
+        right: int | None = None,
+    ) -> None:
+        super().__init__(
+            f"{message} (entry {entry}, expected ccc {expected_ccc}, "
+            f"got {actual_ccc})",
+            codepoint=codepoint,
+        )
+        self.entry = entry
+        self.left = left
+        self.right = right
+        self.expected_ccc = expected_ccc
+        self.actual_ccc = actual_ccc
 
 
 class SegmentLimitError(CanonicalError):
